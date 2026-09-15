@@ -1,47 +1,25 @@
-import { execFile } from 'node:child_process';
-
-import {  getTool, getToolSchemas } from './tools/index.js'
-import { buildSystemPrompt } from './prompt.js'
-import { ToolContent ,ToolResult,ToolRegistry} from './tool.js'
-
+import {  getTool } from './tools/index.js'
+import { ToolContent, ToolResult } from './tool.js'
+import { ChatMessage, ModelAdapter, ProviderThinkingBlock, ProviderUsage } from './type.js'
+import { replaceLargeToolResult, PendingToolResult } from './utils/tool-result.js'
 import { PermissionManager } from './permissionManager.js'
-import { ChatMessage ,ModelAdapter,ProviderThinkingBlock,} from './type.js'
-import { replaceLargeToolResult,PendingToolResult,applyToolResultBudget } from './utils/tool-result.js';
-import { any, boolean, endsWith } from 'zod';
-import { isEnoentError } from './utils/errors.js';
 
-const cwd = process.cwd()
-let sawToolResultThisTurn = false
+export type TurnDiagInfo = {
+  step: number
+  kind: 'final' | 'empty' | 'tools' | 'max_steps'
+  calls?: number
+  usage?: ProviderUsage
+  stopReason?: string
+}
+
+const LOOP_GUARD_AFTER_REPEATS = 3
 
 function isEmptyAssistantResponse(content: string): boolean {
   return content.trim().length === 0
 }
-//对话是否终止的判断函数，具体判断依照大模型
-function shouldTreatAssistantAsProgress(args: {
-  kind?: 'final' | 'progress'
-  content: string
-  sawToolResultThisTurn: boolean
-}): boolean {
-  if (args.kind === 'progress') {
-    return true
-  }
 
-  if (args.kind === 'final') {
-    return false
-  }
-
-  if (!args.sawToolResultThisTurn) {
-    return false
-  }
-
-  return false
-}
-
-type AnthropicContentBlock =
-  | { type: 'text'; text: string }
-  | { type: 'tool_use'; id: string; name: string; input: unknown }
 //TODO 未完善的tool执行工具
-async function executeTool(name: string, rawInput: unknown,context:ToolContent): Promise<ToolResult> {
+async function executeTool(name: string, rawInput: unknown, context: ToolContent): Promise<ToolResult> {
   console.log('=== Tool Call ===')
   console.log('Name:', name)
   console.log('Raw Input:', JSON.stringify(rawInput, null, 2))
@@ -49,21 +27,21 @@ async function executeTool(name: string, rawInput: unknown,context:ToolContent):
   const tool = getTool(name)
   if (!tool) {
     return {
-      ok:false,
-      output:`Error: Tool "${name}" not found`
+      ok: false,
+      output: `Error: Tool "${name}" not found`,
     }
   }
 
   const parse = tool.schema.safeParse(rawInput)
   if (!parse.success) {
     return {
-      ok:false,
-      output:`Error: ${parse.error.message}`
+      ok: false,
+      output: `Error: ${parse.error.message}`,
     }
   }
 
   try {
-    return await tool.run(parse.data,context)
+    return await tool.run(parse.data, context)
   } catch (error) {
     return {
       ok: false,
@@ -72,173 +50,141 @@ async function executeTool(name: string, rawInput: unknown,context:ToolContent):
   }
 }
 
-const messages: Array<{ role: string; content: unknown }> = []
-/*
-参数：
-model: ModelAdapter
-  tools: ToolRegistry
+/**
+ * 合约（修复版）：
+ *  - 所有新消息【就地 push 进 args.messages】（共享数组）——回合中途调度器/压缩能看到真实进度
+ *  - 返回值 = 仅本回合新增（增量），caller 不得再 push 回同一数组
+ *  - 完全相同的 (tool,input) 调用达 LOOP_GUARD_AFTER_REPEATS 次 → 注入 loop-guard 提示
+ */
+export async function agentloop(args: {
+  model: ModelAdapter
   messages: ChatMessage[]
   cwd: string
   permissions?: PermissionManager
-*/ 
-export async function agentloop(args:{
-  
-  model:ModelAdapter
-  messages: ChatMessage[]
-  cwd: string
-  permissions?: PermissionManager
-  maxSteps?:number
+  maxSteps?: number
   onAssistantMessage?: (content: string, metadata?: { final?: boolean }) => void
   onProgressMessage?: (content: string) => void
-  
-}
-): Promise<ChatMessage[]> {
-  let messages = args.messages
-  const maxSteps = args.maxSteps
-  
-  const pushContinuationPrompt=(content:string)=>{
-    messages=[
-      ...messages,
-      {
-        role: 'user',
-        content
+  onTurnDiags?: (info: TurnDiagInfo) => void
+}): Promise<ChatMessage[]> {
+  const messages = args.messages
+  const maxSteps = args.maxSteps ?? 30
+  const added: ChatMessage[] = []
+  const callCounts = new Map<string, number>()
+
+  const append = (...items: ChatMessage[]): void => {
+    for (const item of items) {
+      const content = (item as { content?: string }).content
+      if (item.role === 'user' && (content === undefined || content.trim() === '')) {
+        continue
       }
-    ]
+      messages.push(item)
+      added.push(item)
+    }
   }
-const appendThinkingBlocks = (blocks: ProviderThinkingBlock[] | undefined) => {
+
+  const appendThinkingBlocks = (blocks: ProviderThinkingBlock[] | undefined): void => {
     if (!blocks || blocks.length === 0) return
-    messages = [
-      ...messages,
-      {
-        role: 'assistant_thinking',
-        blocks,
-      },
-    ]
+    append({ role: 'assistant_thinking', blocks })
   }
-//原本是不限制次数的，这个限制最大请求次数
-  for(let step=0 ; maxSteps==null||maxSteps>step;step++) {
-//TODO 函数未完善：上下文压缩，确保上下文不超过字数
-   
-/**if(setp==0){}
- * 
- */
 
-
+  for (let step = 0; maxSteps > step; step++) {
     const response = await args.model.next(messages)
-    
 
-
-
-
-
-    
-//TODO 函数未完善：检查模型返回内容应该继续或结束 
-// 完善了检查progress状态的函数
-//TODO 缺少判空函数
-    if(response.type == 'assistant'){
+    if (response.type === 'assistant') {
       const isEmpty = isEmptyAssistantResponse(response.content)
-      if(!isEmpty&&shouldTreatAssistantAsProgress({kind: response.kind,
-          content: response.content,
-          sawToolResultThisTurn,})
-        ){
-          args.onProgressMessage?.(response.content)
-          //添加思考过程
-          appendThinkingBlocks(response.thinkingBlocks)
-          messages=[
-            ...messages,
-            {role:'assistant_progress',content:response.content}
-          ]
-          pushContinuationPrompt(
-            sawToolResultThisTurn && response.kind !== 'progress'
-            ?""
-            :""
-          )
-          continue
-        }
+      const isProgress = response.kind === 'progress'
 
-        const assistantMessages:ChatMessage={
-          role: 'assistant',
-          content : response.content
-        }
-        appendThinkingBlocks(response.thinkingBlocks)
-        if (!isEmpty) {
+      appendThinkingBlocks(response.thinkingBlocks)
+
+      if (!isEmpty && isProgress) {
+        args.onProgressMessage?.(response.content)
+        append({ role: 'assistant_progress', content: response.content })
+        continue
+      }
+
+      if (!isEmpty) {
         args.onAssistantMessage?.(response.content, { final: true })
       }
-
-        return [assistantMessages]
-
-
+      const assistantMessage: ChatMessage = {
+        role: 'assistant',
+        content: response.content,
+        ...(response.usage ? { usage: response.usage } : {}),
+      }
+      if (!isEmpty) {
+        append(assistantMessage)
+      }
+      args.onTurnDiags?.({
+        step,
+        kind: 'final',
+        usage: response.usage,
+        ...(response.diagnostics?.stopReason ? { stopReason: response.diagnostics.stopReason } : {}),
+      })
+      return added
     }
 
-    
-
-    
-    if ((response.calls?.length ?? 0) === 0 && response.content && response.contentKind !== 'progress') {
-      return messages
+    if ((response.calls?.length ?? 0) === 0) {
+      if (response.content && response.contentKind !== 'progress') {
+        appendThinkingBlocks(response.thinkingBlocks)
+        append({ role: 'assistant_progress', content: response.content })
+        args.onTurnDiags?.({
+          step,
+          kind: 'empty',
+          usage: response.usage,
+          ...(response.diagnostics?.stopReason ? { stopReason: response.diagnostics.stopReason } : {}),
+        })
+        continue
+      }
+      args.onTurnDiags?.({ step, kind: 'empty', usage: response.usage })
+      return added
     }
-    //这是一个数组，包含已有的工具执行的结果
-    const executedToolResults: Array<{
-      call: (typeof response.calls)[number]
-//TODO 接受函数类型不完善,注册器没写，暂时先这样
-     result: Awaited<ReturnType<ToolRegistry['execute']>>
-      toolResult: PendingToolResult
-    }> = []
-    for (const call of response.calls){
-      const result = await executeTool(call.toolName , call.input,{cwd:args.cwd,permissions:args.permissions})
 
-      const toolResult = await replaceLargeToolResult({
+    appendThinkingBlocks(response.thinkingBlocks)
+    append(...response.calls.map(call => ({
+      role: 'assistant_tool_call' as const,
+      toolUseId: call.id,
+      toolName: call.toolName,
+      input: call.input,
+    })))
+
+    const toolResults: PendingToolResult[] = []
+    for (const call of response.calls) {
+      const key = `${call.toolName}\u0000${JSON.stringify(call.input ?? {})}`
+      const count = (callCounts.get(key) ?? 0) + 1
+      callCounts.set(key, count)
+
+      const result = await executeTool(call.toolName, call.input, {
+        cwd: args.cwd,
+        permissions: args.permissions,
+      })
+
+      let output = result.output
+      if (count === LOOP_GUARD_AFTER_REPEATS) {
+        output = `${output}\n\n[loop-guard] 这是第 ${count} 次完全相同的 ${call.toolName} 调用。重复执行不会改变结果——换方法（不同工具/不同参数/读取已有结果文件），或直接基于此前结果给出回答。`
+      }
+
+      toolResults.push(await replaceLargeToolResult({
         role: 'tool_result',
         toolUseId: call.id,
         toolName: call.toolName,
-        content: result.output,
-        isError: !result.ok,
-      }, undefined  )
-      //TODO contentReplacementState将过大的tool输出转化为文件txt形式，返回文件路径
-       executedToolResults.push ({
-        call,
-        result,
-        toolResult
-
-      })
+        content: output,
+        isError: !result.ok || count >= LOOP_GUARD_AFTER_REPEATS,
+      }, undefined))
     }
 
-
-//TODO 预算评估函数，评估新加进去的文本会不会导致上下文超过上线
- //const budgetedResults  
-//TODO 建立索引
-//const ToolResultById 
-
-
-//TODO 处理信息返回结果，没有就使用toolResult 
-
-const toolCallMessages = executedToolResults.map((entry,i)=>{
-  const toolCallMessages: ChatMessage={
-    role:'assistant_tool_call',
-    toolUseId:entry.call.id,
-    toolName:entry.call.toolName,
-    input:entry.call.input,
-    
-  }
-  return toolCallMessages
-})
-
-const toolResults = executedToolResults.map(entry=>entry.toolResult)
-messages = [
-      ...messages,
-      ...toolCallMessages,
-      ...toolResults, 
-    ]
-sawToolResultThisTurn = true
+    append(...toolResults)
+    args.onTurnDiags?.({
+      step,
+      kind: 'tools',
+      calls: response.calls.length,
+      usage: response.usage,
+      ...(response.diagnostics?.stopReason ? { stopReason: response.diagnostics.stopReason } : {}),
+    })
   }
 
-  const maxStepContent = `达到最大工具步数限制，已停止当前回合。`
-  
-  return [
-    ...messages,
-    {
-      role: 'assistant',
-      content: maxStepContent,
-    },
-  ]
+  args.onTurnDiags?.({ step: maxSteps, kind: 'max_steps' })
+  append({
+    role: 'assistant',
+    content: `达到最大工具步数限制（${maxSteps}），已停止当前回合。`,
+  })
+  return added
 }
-

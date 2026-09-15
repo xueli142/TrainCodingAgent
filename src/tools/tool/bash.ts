@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { z } from 'zod'
 import type { ToolContent, ToolDefinition } from '../../tool.js'
+import { buildProcessEnvironment } from '../../environment.js'
 import { resolveToolPath } from '../../workspace.js'
 import { jsonSchemaOf } from './schema-io.js'
 
@@ -199,10 +200,13 @@ function shellForPlatform(): { shell: string; prefixArgs: string[] } {
   return { shell: process.env.SHELL || '/bin/bash', prefixArgs: ['-lc'] }
 }
 
+const PROC_ENV = buildProcessEnvironment()
+
 export const BashTool: ToolDefinition<BashInput> = {
   name: 'bash',
   description: [
     'Executes a given shell command with optional timeout, and returns combined stdout/stderr.',
+    `Be aware: OS=${PROC_ENV.platform}, Shell=${PROC_ENV.shellKind}.`,
     '',
     'Usage:',
     '- This tool is for terminal operations like git, npm, docker. Use the read/write/edit/glob/grep tools for file operations instead of cat/sed/Get-Content.',

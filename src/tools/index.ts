@@ -86,3 +86,5 @@ export function buildToolCatalogMessage(): ChatMessage {
 
   return { role: 'tool', content }
 }
+
+initRegistry()

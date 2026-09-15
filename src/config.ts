@@ -1,6 +1,9 @@
 import path from 'node:path'
 import os from 'node:os'
-
+import 'dotenv/config'
+export const MODEL = process.env.MODEL as string
+export const API_KEY = process.env.API_KEY as string
+ export const BASE_URL = process.env.BASE_URL as string
 export type RuntimeConfig = {
   model: string
   baseUrl: string

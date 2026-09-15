@@ -1,3 +1,5 @@
+import {MODEL,API_KEY,BASE_URL} from "./config.js"
+
 import type {
   AgentStep,
   ChatMessage,
@@ -7,10 +9,11 @@ import type {
   StepDiagnostics,
   ToolCall,
 } from './type.js'
+import { traceRequest } from './context-tracer.js'
 
-const MODEL = 'deepseek-flash'
-const API_KEY = 'sk-4f0d9c656e364430ab78fd785371ed69'
-const BASE_URL = 'https://api.deepseek.com/anthropic'
+// export const MODEL = 'deepseek-flash'
+// const API_KEY = 'sk-4f0d9c656e364430ab78fd785371ed69'
+// const BASE_URL = 'https://api.deepseek.com/anthropic'
 
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
@@ -204,8 +207,16 @@ export class AnthropicModelAdapter implements ModelAdapter {
     }>,
   ) {}
 
+//next 是最小的对话单位，调用llm的原子化操作
   async next(messages: ChatMessage[]): Promise<AgentStep> {
     const payload = toAnthropicMessages(messages)
+    //return 返回一个轨迹记录
+    traceRequest({
+      model: MODEL,
+      system: payload.system,
+      messages: payload.messages,
+      tools: this.tools,
+    })
     const url = `${BASE_URL.replace(/\/$/, '')}/v1/messages`
 
     const response = await fetch(url, {

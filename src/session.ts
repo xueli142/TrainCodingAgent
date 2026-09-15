@@ -2,6 +2,7 @@ import { appendFile, mkdir, open, readFile, readdir, rm, stat, unlink } from 'no
 import { randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { ICEFOX_CODE_DIR } from './config.js'
+import { projectSlug } from './environment.js'
 import type { ChatMessage } from './type.js'
 
 /**
@@ -22,6 +23,10 @@ export type SessionEventType =
   | 'summary'
   | 'snip_boundary'
   | 'rename'
+  | 'context_snapshot'
+  | 'turn_end'
+  | 'error'
+  | 'session_switch'
 
 export type SessionEvent = {
   id: string
@@ -33,6 +38,7 @@ export type SessionEvent = {
   parent: string | null
   message: ChatMessage | null
   title?: string
+  data?: Record<string, unknown>
 }
 
 export type SessionMeta = {
@@ -45,7 +51,7 @@ export type SessionMeta = {
 const MAX_TITLE_LENGTH = 60
 
 function projectDirName(cwd: string): string {
-  return cwd.replace(/[/\\:]+/g, '-').replace(/^-+/, '')
+  return projectSlug(cwd)
 }
 
 export function projectsRoot(): string {
@@ -178,6 +184,14 @@ export async function saveMessages(
   sessionId: string,
   messages: ChatMessage[],
 ): Promise<number> {
+  return withStoreLock(() => saveMessagesLocked(cwd, sessionId, messages))
+}
+
+async function saveMessagesLocked(
+  cwd: string,
+  sessionId: string,
+  messages: ChatMessage[],
+): Promise<number> {
   const existing = await readEvents(cwd, sessionId)
   const savedMessageIds = new Set(
     existing
@@ -234,6 +248,7 @@ type PendingJob = {
   cwd: string
   sessionId: string
   messages: ChatMessage[]
+  lastSavedLength: number
 }
 
 const pendingJobs = new Map<string, PendingJob>()
@@ -244,6 +259,14 @@ function jobKey(cwd: string, sessionId: string): string {
   return `${cwd}\u0000${sessionId}`
 }
 
+let storeLock: Promise<unknown> = Promise.resolve()
+
+function withStoreLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = storeLock.then(fn, fn)
+  storeLock = run.then(() => undefined, () => undefined)
+  return run
+}
+
 async function flushPending(): Promise<number> {
   if (flushing || pendingJobs.size === 0) {
     return 0
@@ -251,8 +274,11 @@ async function flushPending(): Promise<number> {
   flushing = true
   let written = 0
   try {
-    for (const job of [...pendingJobs.values()]) {
-      pendingJobs.delete(jobKey(job.cwd, job.sessionId))
+    for (const job of pendingJobs.values()) {
+      if (job.messages.length === job.lastSavedLength) {
+        continue
+      }
+      job.lastSavedLength = job.messages.length
       written += await saveMessages(job.cwd, job.sessionId, job.messages)
     }
   } finally {
@@ -266,7 +292,12 @@ export function scheduleSave(
   sessionId: string,
   messages: ChatMessage[],
 ): void {
-  pendingJobs.set(jobKey(cwd, sessionId), { cwd, sessionId, messages })
+  const key = jobKey(cwd, sessionId)
+  const existing = pendingJobs.get(key)
+  if (existing && existing.messages === messages) {
+    return
+  }
+  pendingJobs.set(key, { cwd, sessionId, messages, lastSavedLength: -1 })
   if (!flushTimer) {
     flushTimer = setInterval(() => {
       void flushPending().catch(() => {})
@@ -275,13 +306,15 @@ export function scheduleSave(
   }
 }
 
-/** 立即清空窗口（退出路径：/exit、SIGINT、finally）。await 后数据已在盘上。 */
+/** 立即清空窗口（退出/切换路径）。await 后数据已在盘上。 */
 export async function flushSessionSaves(): Promise<number> {
   if (flushTimer) {
     clearInterval(flushTimer)
     flushTimer = null
   }
-  return flushPending()
+  const written = await flushPending()
+  pendingJobs.clear()
+  return written
 }
 
 export function hasPendingSaves(): boolean {
@@ -295,6 +328,30 @@ export async function appendControlEvent(
   type: 'rename',
   data: { title: string },
 ): Promise<SessionEvent> {
+  return appendSessionEvent(cwd, sessionId, type, data, { title: data.title })
+}
+
+/**
+ * 通用控制事件（context_snapshot / turn_end / error / rename 等）：
+ * 不进对话投影，只供审计与确定性重放。事件链（seq/parent）保持完整。
+ */
+export async function appendSessionEvent(
+  cwd: string,
+  sessionId: string,
+  type: SessionEventType,
+  data: Record<string, unknown>,
+  extra?: { title?: string },
+): Promise<SessionEvent> {
+  return withStoreLock(() => appendSessionEventLocked(cwd, sessionId, type, data, extra))
+}
+
+async function appendSessionEventLocked(
+  cwd: string,
+  sessionId: string,
+  type: SessionEventType,
+  data: Record<string, unknown>,
+  extra?: { title?: string },
+): Promise<SessionEvent> {
   const existing = await readEvents(cwd, sessionId)
   const last = existing.at(-1)
   const event: SessionEvent = {
@@ -306,14 +363,42 @@ export async function appendControlEvent(
     ts: new Date().toISOString(),
     parent: last?.id ?? null,
     message: null,
-    title: data.title,
+    ...(extra?.title !== undefined ? { title: extra.title } : {}),
+    data,
   }
   await appendRawEvents(cwd, sessionId, [event])
   return event
 }
 
-/** 投影：事件 → 下一轮请求可用的 ChatMessage[]（snip 重排，rename 不进对话） */
-export function projectMessages(events: SessionEvent[]): ChatMessage[] {
+const TOOL_ECHO_CHARS = 25_000
+
+/** tool_result → user 文本块（结构化 tool_use/tool_result 对在恢复历史中不再成对出现） */
+function normalizeToolResultToText(
+  message: Extract<ChatMessage, { role: 'tool_result' }>,
+): ChatMessage {
+  const head = message.isError
+    ? `[tool ${message.toolName} returned an error]`
+    : `[tool ${message.toolName} result]`
+  const body = message.content.trim()
+    ? message.content.slice(0, TOOL_ECHO_CHARS)
+    : '(empty output)'
+  return {
+    role: 'user',
+    content: `${head}\n${body}`,
+    ...(message.id ? { id: message.id } : {}),
+  }
+}
+
+/**
+ * 投影：盘上有全部 8 种事实，进上下文的只有三类派生视图——
+ * user 输入 / assistant 最终回答 / 工具返回结果（降维成 user 文本）。
+ * 丢弃：thinking、progress、tool_call（input 原文仍留在事件里审计）。
+ * summary 与 snip 标记属于历史演进的组成部分，保留。
+ */
+export function projectMessages(allEvents: SessionEvent[]): ChatMessage[] {
+  const lastSummary = allEvents.findLastIndex(event => event.type === 'summary')
+  const events = lastSummary > 0 ? allEvents.slice(lastSummary) : allEvents
+
   const snips = events.filter(
     event =>
       event.type === 'snip_boundary' &&
@@ -336,30 +421,47 @@ export function projectMessages(events: SessionEvent[]): ChatMessage[] {
   const projected: ChatMessage[] = []
   const emittedSnips = new Set<string>()
 
+  const take = (message: ChatMessage | null): void => {
+    if (!message) {
+      return
+    }
+    switch (message.role) {
+      case 'user':
+        projected.push(message); return
+      case 'assistant':
+        if (message.content.trim().length > 0) projected.push(message); return
+      case 'context_summary':
+      case 'snip_boundary':
+        projected.push(message); return
+      case 'tool_result':
+        projected.push(normalizeToolResultToText(message)); return
+      default:
+        return // assistant_thinking / assistant_progress / assistant_tool_call：不进上下文
+    }
+  }
+
   for (const event of events) {
-    if (event.type === 'rename') {
-      continue
+    if (event.type === 'rename' || !event.message) {
+      continue // 控制事件（snapshot/turn_end/error/rename）永不投影
     }
 
     if (event.type === 'snip_boundary') {
-      if (snips.length === 0 || !removedToSnip.size) {
-        if (event.message) projected.push(event.message)
+      if (!removedToSnip.size) {
+        take(event.message)
       }
       continue
     }
 
-    const owningSnip = removedToSnip.get(event.message?.id ?? '')
+    const owningSnip = removedToSnip.get(event.message.id ?? '')
     if (owningSnip) {
       if (!emittedSnips.has(owningSnip.id)) {
-        projected.push(owningSnip.message as ChatMessage)
+        take(owningSnip.message)
         emittedSnips.add(owningSnip.id)
       }
       continue
     }
 
-    if (event.message) {
-      projected.push({ ...event.message, id: event.message.id } as ChatMessage)
-    }
+    take(event.message)
   }
 
   return projected

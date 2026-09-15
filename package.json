@@ -2,18 +2,22 @@
   "name": "claude-cli",
   "version": "1.0.0",
   "type": "module",
+  "bin": {
+    "icefox": "./bin/icefox.js"
+  },
   "scripts": {
-    "predev": "pnpm install",
-    "dev": "tsx src/index.ts",
+    "prestart": "pnpm install",
+    "start": "tsx src/index.ts",
     "check-deps": "node scripts/check-deps.js"
   },
   "devDependencies": {
-    "@types/node": "^26.0.0",
     "@types/diff": "^5.0.0",
+    "@types/node": "^26.0.0",
     "tsx": "^4.22.4"
   },
   "dependencies": {
     "diff": "^5.2.0",
+    "dotenv": "^17.4.2",
     "zod": "^4.4.3"
   }
 }
