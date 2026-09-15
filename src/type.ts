@@ -22,6 +22,7 @@ export type MessageIdentity = {
 
 export type ChatMessage =
   | ({ role: 'system'; content: string } & MessageIdentity)
+  | ({ role: 'tool'; content: string } & MessageIdentity)
   | ({ role: 'user'; content: string } & MessageIdentity)
   | ({ role: 'assistant_thinking'; blocks: ProviderThinkingBlock[] } & MessageIdentity)
   | ({ role: 'assistant'; content: string } & ProviderUsageMetadata & MessageIdentity)

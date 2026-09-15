@@ -8,9 +8,9 @@ import type {
   ToolCall,
 } from './type.js'
 
-const MODEL = 'LongCat-2.0'
-const API_KEY = 'ak_24o64D27B5pM33y7Xd9Wg2dP1CU3S'
-const BASE_URL = 'https://api.longcat.chat/anthropic'
+const MODEL = 'deepseek-flash'
+const API_KEY = 'sk-4f0d9c656e364430ab78fd785371ed69'
+const BASE_URL = 'https://api.deepseek.com/anthropic'
 
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
@@ -129,19 +129,19 @@ function pushAnthropicMessage(
   messages.push({ role, content: [block] })
 }
 
-function toAnthropicMessages(messages: ChatMessage[]): {
+export function toAnthropicMessages(messages: ChatMessage[]): {
   system: string
   messages: AnthropicMessage[]
 } {
   const system = messages
-    .filter(message => message.role === 'system')
+    .filter(message => message.role === 'system' || message.role === 'tool')
     .map(message => message.content)
     .join('\n\n')
 
   const converted: AnthropicMessage[] = []
 
   for (const message of messages) {
-    if (message.role === 'system') continue
+    if (message.role === 'system' || message.role === 'tool') continue
 
     if (message.role === 'user') {
       pushAnthropicMessage(converted, 'user', toTextBlock(message.content))
