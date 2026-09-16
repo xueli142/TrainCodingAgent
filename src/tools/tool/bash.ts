@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import path from 'node:path'
 import { z } from 'zod'
 import type { ToolContent, ToolDefinition } from '../../tool.js'
 import { buildProcessEnvironment } from '../../environment.js'
@@ -87,6 +88,59 @@ async function approveCommandSegments(
     }
     const [head, ...rest] = tokens
     await context.permissions?.ensureCommand(head, rest, cwd)
+  }
+}
+
+/** 从整条命令行抽路径候选：引号包裹的绝对路径 / 裸盘符路径 / ..相对路径 */
+export function extractPathCandidates(command: string): string[] {
+  const found = new Set<string>()
+  const patterns = [
+    /["']((?:[A-Za-z]:[\\/]|\\\\)[^"']+)["']/g,
+    /(?:^|[\s=,(])([A-Za-z]:[\\/][^\s"',;)|>]*)/g,
+    /(?:^|[\s=,(])((?:\.\.[\\/])+[^\s"',;)|>]*)/g,
+  ]
+  for (const pattern of patterns) {
+    for (const match of command.matchAll(pattern)) {
+      const raw = match[1]?.trim()
+      if (raw && raw.length > 2) {
+        found.add(raw)
+      }
+    }
+  }
+  return [...found]
+}
+
+/**
+ * 绕行硬闸：命令里触碰的每个路径——
+ *  - 越出 workspace → 过与 write 同一把 path 闸（同一张卡、同一份拒绝记忆）
+ *    （path 闸无 approver 时会抛中性硬停文案，不会被当成绕行线索）
+ *  - 命中已被用户拒绝的 edit 目标 → 直接抛，不再弹卡（deny 记忆不可被 bash 洗掉）
+ */
+async function gateTouchedPaths(context: ToolContent, command: string, cwd: string): Promise<void> {
+  const permissions = context.permissions
+  if (!permissions) {
+    return
+  }
+  for (const raw of extractPathCandidates(command)) {
+    let candidate: string
+    try {
+      candidate = path.resolve(cwd, raw)
+    } catch {
+      continue
+    }
+    const relative = path.relative(cwd, candidate)
+    const inside =
+      relative === '' ||
+      (!relative.startsWith('..') && !path.isAbsolute(relative))
+
+    if (await permissions.isEditDenied(candidate)) {
+      throw new Error(
+        `Blocked: the user already denied edits touching ${candidate}. This denial cannot be bypassed via bash — stop and ask the user what to do.`,
+      )
+    }
+    if (!inside) {
+      await permissions.ensurePathAccess(candidate, 'write')
+    }
   }
 }
 
@@ -214,6 +268,7 @@ export const BashTool: ToolDefinition<BashInput> = {
     '- Quote file paths that contain spaces. Chain dependent commands with "&&" on unix shells and with `; if ($?) { cmd2 }` on Windows PowerShell.',
     '- If you need to run multiple independent commands in parallel, make multiple bash tool calls in a single response.',
     '- Before running commands that create files or directories, verify the parent path exists.',
+    '- If a previous write/edit to a path was denied by the user, you MUST NOT recreate that effect via bash (Set-Content, Out-File, redirection, WriteAllText, rm, mv, ...). Denials are enforced at this tool and are final for the session.',
     '',
     'Git:',
     '- Only commit, amend, push, or create PRs when explicitly requested by the user.',
@@ -229,6 +284,7 @@ export const BashTool: ToolDefinition<BashInput> = {
     const timeout = input.timeout ?? DEFAULT_TIMEOUT_MS
 
     await approveCommandSegments(context, input.command, cwd)
+    await gateTouchedPaths(context, input.command, cwd)
 
     const { shell, prefixArgs } = shellForPlatform()
     const outcome = await runShell(shell, [...prefixArgs, input.command], cwd, timeout)

@@ -11,9 +11,6 @@ import type {
 } from './type.js'
 import { traceRequest } from './context-tracer.js'
 
-// export const MODEL = 'deepseek-flash'
-// const API_KEY = 'sk-4f0d9c656e364430ab78fd785371ed69'
-// const BASE_URL = 'https://api.deepseek.com/anthropic'
 
 type AnthropicContentBlock =
   | { type: 'text'; text: string }
@@ -223,7 +220,7 @@ export class AnthropicModelAdapter implements ModelAdapter {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'anthropic-version': '2023-06-01',
+        'anthropic-version': '2026-06-01',
         Authorization: `Bearer ${API_KEY}`,
       },
       body: JSON.stringify({

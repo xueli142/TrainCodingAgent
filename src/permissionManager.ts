@@ -214,6 +214,13 @@ export class PermissionManager {
     this.turnAllowAllEdits = false
   }
 
+  /** bash 绕行硬闸用：该目标是否已被拒绝（session 级或持久化） */
+  async isEditDenied(targetPath: string): Promise<boolean> {
+    await this.ready
+    const normalizedTarget = normalizePath(targetPath)
+    return this.sessionDeniedEdits.has(normalizedTarget) || this.deniedEditPatterns.has(normalizedTarget)
+  }
+
   endTurn(): void {
     this.turnAllowedEdits.clear()
     this.turnAllowAllEdits = false
@@ -282,7 +289,7 @@ export class PermissionManager {
 
     if (!this.prompt) {
       throw new Error(
-        `Path ${normalizedTarget} is outside cwd ${this.workspaceRoot}. Start ICEFOXcode in TTY mode to approve it.`,
+        `Path ${normalizedTarget} is outside cwd ${this.workspaceRoot} and NO interactive approval is available right now. Hard restriction: do not attempt this access through bash redirection, shell writes, or any other tool. Stop and tell the user; only they can grant it.`,
       )
     }
 
@@ -362,7 +369,7 @@ export class PermissionManager {
 
     if (!this.prompt) {
       throw new Error(
-        `Command requires approval: ${signature}. Start ICEFOXcode in TTY mode to approve it.`,
+        `Command requires approval but no interactive approver is available: ${signature}. Hard restriction: do not retry through alternative commands, interpreters, or shell forms. Explain the block to the user and ask them to run it.`,
       )
     }
 
@@ -429,7 +436,7 @@ export class PermissionManager {
 
     if (!this.prompt) {
       throw new Error(
-        `Edit requires approval: ${normalizedTarget}. Start ICEFOXcode in TTY mode to review it.`,
+        `Edit requires approval but no interactive approver is available: ${normalizedTarget}. Hard restriction: do NOT accomplish this file change through bash (redirection, Set-Content, Out-File, WriteAllText, etc.). Tell the user what was blocked.`,
       )
     }
 

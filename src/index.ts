@@ -3,6 +3,7 @@ import readline from 'node:readline'
 import { buildToolCatalogMessage, getToolSchemas, initRegistry } from './tools/index.js'
 import { buildSystemPrompt } from './prompt.js'
 import { PermissionManager } from './permissionManager.js'
+import { createPermissionPromptHandler } from './permissionUi.js'
 import { agentloop } from './agent_loop.js'
 import { AnthropicModelAdapter } from './anthropic-adapter.js'
 import type { ChatMessage } from './type.js'
@@ -73,7 +74,8 @@ async function main(): Promise<void> {
     return
   }
 
-  const permissions = new PermissionManager(cwd)
+  const permissions = new PermissionManager(cwd, createPermissionPromptHandler())
+  //等待磁盘权限加载完
   await permissions.whenReady()
 
   const model = new AnthropicModelAdapter(getToolSchemas())

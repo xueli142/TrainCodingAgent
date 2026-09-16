@@ -14,9 +14,9 @@
 - 💾 **事件溯源会话** —— append-only JSONL，按 `message.id` 幂等增量落盘，支持恢复与切换
 - 🗜️ **自动上下文压缩** —— 估算占用超过窗口 85% 时，把中段旧消息摘要成 `context_summary`
 - 🌱 **环境探针** —— 进程/项目环境（平台、shell、git 根、trust 状态）注入系统提示
-- 🔍 **上下文追踪** —— `--trace` 把每轮完整请求落盘，`inspect-trace` 离线回看与 diff
+- 🔍 **上下文追踪** —— **默认开启**：每轮发给模型的完整请求（system/messages/tools）落盘 `traces/`，`inspect-trace` 离线回看与 diff；`ICEFOX_TRACE=0` 关闭
 - 🧩 **思考块与进度标记** —— 保留 provider thinking 块，识别 `<progress>` / `[PROGRESS]` 中间态
-- 🔐 **权限约束层** —— 工作区越界检查、改文件前必须先读、危险命令分类（详见「安全与权限」）
+- 🔐 **权限约束层** —— 编辑/危险命令/越界的交互式审批卡（控制台直读，不抢 REPL 的 stdin）、系统级拒绝的 bash 绕行硬闸、危险命令分类（详见「安全与权限」）
 
 ## 快速开始
 
@@ -34,8 +34,8 @@ pnpm start -- --sessions
 pnpm start -- --resume
 pnpm start -- --resume <sessionId>
 
-# 记录每轮请求上下文（排查用）
-pnpm start -- --trace
+# 关闭请求追踪（默认开启）
+$env:ICEFOX_TRACE = '0'; pnpm start
 ```
 
 退出：输入 `/exit`，或按 `Ctrl+C`（会先 flush trace 与待写会话）。
@@ -44,11 +44,11 @@ pnpm start -- --trace
 
 ### REPL 内命令
 
-| 命令 | 说明 |
-| --- | --- |
-| `/exit` | 退出 |
-| `/sessions` | 列出本项目的历史会话（当前会话带 `*` 标记） |
-| `/resume` | 列出会话并提示用法 |
+| 命令                  | 说明                                                 |
+| --------------------- | ---------------------------------------------------- |
+| `/exit`             | 退出                                                 |
+| `/sessions`         | 列出本项目的历史会话（当前会话带`*` 标记）         |
+| `/resume`           | 列出会话并提示用法                                   |
 | `/resume <id\|序号>` | 切到指定会话（切换前会打印当前会话的上下文投影预览） |
 
 ## 工作原理
@@ -63,6 +63,10 @@ pnpm start -- --trace
 `assistant_progress` / `assistant_tool_call` / `tool_result` / `context_summary` / `snip_boundary`。
 适配器发送前会把它们折叠成 Anthropic 的 `system` + `messages`（`tool_use` / `tool_result` 配对）。
 
+> **agentloop 合约（勿回退）**：所有新消息**就地 push 进调用方共享的 `messages` 数组**（回合中途调度器即可见、
+> 崩溃窗口 ≤1s）；返回值是**仅新增的增量**，调用方不得再 push 回同一数组（历史曾因此重复、诱发模型连环重试）。
+> `question` 与 `task` 两个工具支持宿主注入处理器（`setQuestionHandler` / `setTaskExecutor`），未注入时返回引导文案而非崩溃。
+
 ## 项目结构
 
 ```
@@ -73,7 +77,9 @@ src/
 ├─ prompt.ts             # 系统提示词（cwd + 环境块 + 权限摘要）
 ├─ type.ts               # ChatMessage / AgentStep / ModelAdapter 等类型
 ├─ tool.ts               # ToolDefinition / ToolResult / ToolRegistry
-├─ permissionManager.ts  # 权限决策（path / command / edit，持久化 permissions.json）
+ ├─ permissionManager.ts  # 权限决策（path / command / edit，持久化 permissions.json，isEditDenied 绕行检查）
+ ├─ permissionUi.ts       # 交互式审批卡（渲染 PermissionRequest 七选项，deny_with_feedback 采集用户指引）
+ ├─ tty-prompt.ts         # 控制台直读（Windows CONIN$ / POSIX /dev/tty），不与主 readline 抢 stdin
 ├─ session.ts            # 事件溯源会话存储 + 投影（projectMessages）
 ├─ compact.ts            # 上下文压缩（estimateTokens / maybeCompactContext）
 ├─ environment.ts        # 进程环境 / 项目环境 / trust.json
@@ -100,19 +106,19 @@ src/
 
 ## 工具集
 
-| 工具 | 说明 |
-| --- | --- |
-| `read` | 读取文件 / 目录，行号前缀；二进制拒绝 |
-| `write` | 写入文件（要求先 `read`） |
-| `edit` | 精确字符串替换，失败即报错；返回 diff |
-| `bash` | 执行终端命令，支持 `timeout` / `workdir`，尾部截断 |
-| `glob` | 按文件名模式匹配（最多 100 条，按修改时间倒序） |
-| `grep` | 按内容正则搜索（最多 200 条匹配） |
-| `todowrite` | 维护任务列表（全量替换，`in_progress` 至多一条） |
-| `question` | 向用户提问（**未接线**） |
-| `skill` | 从 `.icefox/skills` 或 `~/.ICEFOX-code/skills` 加载 `SKILL.md` |
-| `task` | 派发子任务（**未接线**） |
-| `webfetch` | 抓取网页并转纯文本，超长截断 |
+| 工具          | 说明                                                                |
+| ------------- | ------------------------------------------------------------------- |
+| `read`      | 读取文件 / 目录，行号前缀；二进制拒绝                               |
+| `write`     | 写入文件（要求先`read`）                                          |
+| `edit`      | 精确字符串替换，失败即报错；返回 diff                               |
+| `bash`      | 执行终端命令，支持`timeout` / `workdir`，尾部截断               |
+| `glob`      | 按文件名模式匹配（最多 100 条，按修改时间倒序）                     |
+| `grep`      | 按内容正则搜索（最多 200 条匹配）                                   |
+| `todowrite` | 维护任务列表（全量替换，`in_progress` 至多一条）                  |
+| `question`  | 向用户提问（**未接线**）                                      |
+| `skill`     | 从`.icefox/skills` 或 `~/.ICEFOX-code/skills` 加载 `SKILL.md` |
+| `task`      | 派发子任务（**未接线**）                                      |
+| `webfetch`  | 抓取网页并转纯文本，超长截断                                        |
 
 ## 数据目录
 
@@ -146,8 +152,8 @@ src/
 ## 调试与排查
 
 ```bash
-# 1) 启动时打开 trace，每轮请求（system / messages / tools 全文）追加到 ~/.ICEFOX-code/traces
-pnpm start -- --trace
+# 1) 默认即记录：每轮请求（system / messages / tools 全文）追加到 ~/.ICEFOX-code/traces
+pnpm start
 
 # 2) 离线查看
 npx tsx src/inspect-trace.ts                    # 列出最近的 trace 文件
@@ -164,15 +170,23 @@ npx tsx src/dump-context.ts
 
 ## 安全与权限
 
-- **路径**：所有工具路径先经 `workspace.ts` 解析到 cwd；越界交给 `PermissionManager`
-- **改前必读**：`read-state.ts` 记录已读文件的 `mtime/size`，`write`/`edit` 前校验（改动过要重读）
-- **危险命令分类**：`git reset --hard` / `git clean` / `git checkout --` / `git push --force` / `npm publish`，以及 `node` / `python3` / `bun` / `bash` / `sh` 等任意代码执行
-- **决策持久化**：允许/拒绝规则写入 `permissions.json`，可跨会话生效
-- **超长输出**：超过 50,000 字符的工具结果落盘，上下文里只留预览与文件路径
+四层机制（人的通道 = 审批卡；模型的通道 = 文案+硬闸+规则，两条都要有，只做一条会被绕过）：
 
-> ⚠️ 目前交互式审批 UI **尚未接线**：`index.ts` 里 `new PermissionManager(cwd)` 没有传入 prompt handler，
-> 因此需要审批的操作（如 `edit`/`write`、越界访问、危险命令）会直接抛出 `requires approval ... TTY mode`。
-> 在接上审批回调之前，这类操作实际上是被硬拒的。
+- **三闸 × 四层记忆**（`permissionManager.ts`，与 MiniCode 同构）：
+  - path：workspace 内自动放行；越界弹卡（allow once / 永久允许目录 / 拒绝…），作用域自动收缩到父目录
+  - command：危险分类表（`git reset --hard` / `clean` / `push -f`、`npm publish`、`node`/`python`/`sh` 任意代码执行）命中才弹卡，其余静默放行
+  - edit：永远弹卡，7 选项（单次 / 本回合此文件 / 本回合全部 / 永久此文件 / 拒 / 拒+用户反馈 / 永久拒）；diff 即审批界面
+  - 记忆层级：持久化（`permissions.json`）＞ 进程 session ＞ 回合 turn（`beginTurn`/`endTurn` 由 index 包住每轮）＞ 一次性
+- **交互式审批卡**（`permissionUi.ts` + `tty-prompt.ts`）：独立打开控制台输入（Windows `CONIN$` / POSIX `/dev/tty`），
+  阻塞式单行读——绕开主 readline 的 stdin 占用，回合中途弹卡不互踩；拿不到控制台时自动 deny_once
+- **拒绝不可绕过**（bash 绕行硬闸，`tools/tool/bash.ts gateTouchedPaths`）：
+  - 从整条命令行抽取路径候选（引号绝对路径 / 裸盘符路径 / `..` 相对路径）
+  - 越出 workspace → 与 write 走**同一把 path 闸**（同一张卡、同一份拒绝记忆）
+  - 命中已被拒绝的 edit 目标 → **直接抛错，不再弹卡**（deny 记忆不能被任何 bash 形态洗掉：重定向、Set-Content、WriteAllText、rm/mv…）
+- **拒绝文案中性化**：三处 no-approver 抛错文案不再含实现线索（曾经的 "TTY mode" 被模型当成了绕行思路），
+  统一为 "Hard restriction: do NOT … through bash"；`prompt.ts` 与 `bash` 工具描述里同步声明"拒绝即终局"
+- **loop-guard**（`agent_loop.ts`）：完全相同的 (tool, input) 第 3 次起在结果尾部注入警告并标 `is_error`，掐断模型无脑重试
+- **改前必读**：`read-state.ts` 记录已读文件的 `mtime/size`，`write`/`edit` 前校验（外部改动过要重读）—— 盘上内容与模型所见不一致时禁止盲写
 
 ## 技术栈
 
@@ -184,11 +198,10 @@ npx tsx src/dump-context.ts
 ## 已知问题与待办
 
 - ⚠️ `anthropic-adapter.ts` 里 API Key 与 `BASE_URL` 硬编码，且 `config.ts` 的 `RuntimeConfig` 未被使用 —— 应改读环境变量
-- ⚠️ `PermissionManager` 的交互式 prompt handler 未接线（见上），`edit`/`write`/危险命令目前直接被拒
 - `question`、`task` 工具未接线（`setQuestionHandler` / `setTaskExecutor` 未被调用）
 - `skill` 的 `available_skills` 未注入系统提示（`formatSkillsForPrompt` 未被调用），模型只能猜技能名
 - 工具结果的**批量预算**（`utils/tool-result.ts` 的 `applyToolResultBudget`）尚未接入 `agent_loop`
-- `agent_loop.ts` 中 `shouldTreatAssistantAsProgress` 目前恒为 `false`，progress 中间态判断未实现
+- progress 判定只认显式 `kind==='progress'`（推断式启发曾把工具轮后的正常完成误判为进度、诱发连环重复调用，已删）；若需要更智能的续跑判断，重新设计而非回退启发式
 - 遗留/空文件可清理：`checkroute.ts`、`register.ts`（空）、`src/text/`（空）、`src/tools/` 顶层的旧工具、`test-tool.ts`（引用旧路径）
 - 工程配置：`package.json` 的 `name` 仍是 `claude-cli`，`check-deps` 指向不存在的 `scripts/check-deps.js`，`inspect-trace` 提示的 `pnpm dev` 脚本不存在
 

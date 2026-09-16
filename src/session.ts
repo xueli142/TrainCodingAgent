@@ -5,6 +5,7 @@ import { ICEFOX_CODE_DIR } from './config.js'
 import { projectSlug } from './environment.js'
 import type { ChatMessage } from './type.js'
 
+
 /**
  * 会话事件存储（event-sourced，参照 MiniCode/opencode 裁剪）：
  * - 事实源：~/.ICEFOX-code/projects/<cwd-slug>/<sessionId>.jsonl，一行一个 JSON 事件，append-only
@@ -33,6 +34,7 @@ export type SessionEvent = {
   session: string
   seq: number
   cwd: string
+  chunkId: string
   type: SessionEventType
   ts: string
   parent: string | null
@@ -139,6 +141,7 @@ export async function getEvent(
 async function appendRawEvents(
   cwd: string,
   sessionId: string,
+  
   events: SessionEvent[],
 ): Promise<void> {
   await mkdir(projectDir(cwd), { recursive: true })
@@ -183,6 +186,8 @@ export async function saveMessages(
   cwd: string,
   sessionId: string,
   messages: ChatMessage[],
+ 
+  
 ): Promise<number> {
   return withStoreLock(() => saveMessagesLocked(cwd, sessionId, messages))
 }
@@ -191,7 +196,9 @@ async function saveMessagesLocked(
   cwd: string,
   sessionId: string,
   messages: ChatMessage[],
+  
 ): Promise<number> {
+  const chunkId = randomUUID()
   const existing = await readEvents(cwd, sessionId)
   const savedMessageIds = new Set(
     existing
@@ -220,6 +227,7 @@ async function saveMessagesLocked(
     const event: SessionEvent = {
       id: randomUUID(),
       session: sessionId,
+      chunkId:chunkId,
       seq: seq++,
       cwd,
       type: roleToType(message),
@@ -247,6 +255,7 @@ export const SAVE_FLUSH_INTERVAL_MS = 1000
 type PendingJob = {
   cwd: string
   sessionId: string
+  
   messages: ChatMessage[]
   lastSavedLength: number
 }
@@ -325,6 +334,7 @@ export function hasPendingSaves(): boolean {
 export async function appendControlEvent(
   cwd: string,
   sessionId: string,
+  
   type: 'rename',
   data: { title: string },
 ): Promise<SessionEvent> {
@@ -338,6 +348,7 @@ export async function appendControlEvent(
 export async function appendSessionEvent(
   cwd: string,
   sessionId: string,
+  
   type: SessionEventType,
   data: Record<string, unknown>,
   extra?: { title?: string },
@@ -348,6 +359,7 @@ export async function appendSessionEvent(
 async function appendSessionEventLocked(
   cwd: string,
   sessionId: string,
+
   type: SessionEventType,
   data: Record<string, unknown>,
   extra?: { title?: string },
@@ -357,8 +369,10 @@ async function appendSessionEventLocked(
   const event: SessionEvent = {
     id: randomUUID(),
     session: sessionId,
+    chunkId:randomUUID(),
     seq: (last?.seq ?? -1) + 1,
     cwd,
+    
     type,
     ts: new Date().toISOString(),
     parent: last?.id ?? null,
@@ -470,11 +484,20 @@ export function projectMessages(allEvents: SessionEvent[]): ChatMessage[] {
 export async function resumeMessages(
   cwd: string,
   sessionId: string,
+  chunkId?:string,
 ): Promise<ChatMessage[] | null> {
   const events = await readEvents(cwd, sessionId)
   if (events.length === 0) {
     return null
   }
+  let sliced = events
+  if(chunkId){
+    const idx = events.findIndex(e=>e.chunkId===chunkId)
+    if(idx===-1)return null
+    //按照events数组的切块来返回resume
+    sliced = events.slice(0,idx)
+  }
+
   const messages = projectMessages(events)
   return messages.length > 0 ? messages : null
 }
@@ -558,3 +581,22 @@ export async function clearSession(
     // dir already gone
   }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

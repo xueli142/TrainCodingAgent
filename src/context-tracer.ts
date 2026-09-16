@@ -10,6 +10,7 @@ import { ICEFOX_CODE_DIR } from './config.js'
 
 export type TracedTool = {
   name: string
+  description: string
   descChars: number
   schemaChars: number
   schema: unknown
@@ -67,6 +68,7 @@ export function traceRequest(input: RequestTraceInput): void {
     const schema = JSON.stringify(tool.input_schema)
     return {
       name: tool.name,
+      description: tool.description,
       descChars: tool.description.length,
       schemaChars: schema.length,
       schema: tool.input_schema,
