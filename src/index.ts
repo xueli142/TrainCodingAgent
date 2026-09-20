@@ -9,6 +9,9 @@ import { AnthropicModelAdapter } from './anthropic-adapter.js'
 import type { ChatMessage } from './type.js'
 import { enableTrace, flushTrace } from './context-tracer.js'
 import{MODEL}from './config.js'
+import { createContentReplacementState } from './utils/tool-result.js'
+import { discoverSkills, formatSkillsForPrompt } from './tools/tool/index.js'
+
 import {
   buildProcessEnvironment,
   buildProjectEnvironment,
@@ -32,10 +35,37 @@ import { maybeCompactContext } from './compact.js'
 setDefaultResultOrder('ipv4first')
 
 initRegistry()
+import { setQuestionHandler } from './tools/tool/index.js'
+import { readLine,attachInputSource } from './tty-prompt.js'
 
+setQuestionHandler(async (questions) => {
+  const answers: string[] = []
+  for (const q of questions) {
+    console.log(`\n? [${q.header}] ${q.question}`)
+    q.options.forEach((o, i) =>
+      console.log(`  ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`))
+    const tip = q.multiple ? '输入编号(逗号分隔)或自述，回车确认: ' : '输入编号或自述: '
+    const line = await readLine(tip)
+    if (line === null) throw new Error('No interactive console available') // question.ts 会捕获 → ok:false 引导模型改纯文本提问
+    const raw = line.trim()
+    if (!q.multiple) {
+      // 单选：仅当整行是合法编号才映射成选项，否则整行原样作为自由文本（避免带空格的回答被切碎）
+      const n = Number(raw)
+      answers.push(Number.isInteger(n) && n >= 1 && n <= q.options.length ? q.options[n - 1].label : raw)
+      continue
+    }
+    const picked = raw.split(/[,，、\s]+/).map(s => {
+      const n = Number(s)
+      return Number.isInteger(n) && n >= 1 && n <= q.options.length ? q.options[n - 1].label : s
+    }).filter(Boolean)
+    answers.push(picked.join(', '))
+  }
+  return answers
+})
 const argv = process.argv.slice(2)
 const procEnv = buildProcessEnvironment()
 const projectEnv = buildProjectEnvironment(process.cwd(), procEnv)
+const toolResultState = createContentReplacementState()
 
 function flagValue(flag: string): string | undefined | null {
   const index = argv.indexOf(flag)
@@ -60,7 +90,7 @@ function previewMessages(messages: ChatMessage[], count = 4): string[] {
 
 async function main(): Promise<void> {
   const cwd = process.cwd()
-
+  const skillsBlock = formatSkillsForPrompt(await discoverSkills(cwd))
   if (argv.includes('--sessions')) {
     const sessions = await listSessions(cwd)
     if (sessions.length === 0) {
@@ -85,6 +115,7 @@ async function main(): Promise<void> {
       cwd,
       permissions.getSummary(),
       renderEnvironmentBlock(procEnv, projectEnv, MODEL),
+      skillsBlock,
     )
   }
 
@@ -138,6 +169,7 @@ async function main(): Promise<void> {
     input: process.stdin,
     output: process.stdout,
   })
+  attachInputSource(rl)
 
   const flushOnExit = async () => {
     await flushTrace()
@@ -203,8 +235,12 @@ async function main(): Promise<void> {
   }
 
   try {
-    for await (const rawInput of rl) {
-      const input = rawInput.trim()
+    while (true) {
+      const raw = await readLine()
+      if (raw === null) {
+        break // EOF（Ctrl+D / 管道关闭）：退出循环，走 flushOnExit
+      }
+      const input = raw.trim()
       if (!input) {
         continue
       }
@@ -252,6 +288,9 @@ async function main(): Promise<void> {
           cwd,
           permissions,
           maxSteps: 30,
+          toolResultState,
+          onAssistantMessage: content => { console.log(`\n${content}\n`) },
+          onProgressMessage: content => { console.log(`[progress] ${content}`) },
           onTurnDiags: info => {
             void appendSessionEvent(cwd, sessionId, 'turn_end', { ...info }).catch(() => {})
           },
@@ -265,11 +304,6 @@ async function main(): Promise<void> {
         console.log(`\n[error] ${error instanceof Error ? error.message : String(error)}\n`)
       } finally {
         permissions.endTurn()
-      }
-
-      const last = [...messages].reverse().find(m => m.role === 'assistant')
-      if (last && last.role === 'assistant') {
-        console.log(`\n${last.content}\n`)
       }
     }
   } finally {

@@ -1,8 +1,8 @@
 import {  getTool } from './tools/index.js'
 import { ToolContent, ToolResult } from './tool.js'
 import { ChatMessage, ModelAdapter, ProviderThinkingBlock, ProviderUsage } from './type.js'
-import { replaceLargeToolResult, PendingToolResult } from './utils/tool-result.js'
 import { PermissionManager } from './permissionManager.js'
+import { replaceLargeToolResult, applyToolResultBudget, PendingToolResult, ContentReplacementState } from './utils/tool-result.js'
 
 export type TurnDiagInfo = {
   step: number
@@ -51,10 +51,14 @@ async function executeTool(name: string, rawInput: unknown, context: ToolContent
 }
 
 /**
+ * 
+ * 
  * 合约（修复版）：
  *  - 所有新消息【就地 push 进 args.messages】（共享数组）——回合中途调度器/压缩能看到真实进度
  *  - 返回值 = 仅本回合新增（增量），caller 不得再 push 回同一数组
  *  - 完全相同的 (tool,input) 调用达 LOOP_GUARD_AFTER_REPEATS 次 → 注入 loop-guard 提示
+ * 
+ *  args权威定义了参数
  */
 export async function agentloop(args: {
   model: ModelAdapter
@@ -62,15 +66,17 @@ export async function agentloop(args: {
   cwd: string
   permissions?: PermissionManager
   maxSteps?: number
+  
+  toolResultState?: ContentReplacementState
   onAssistantMessage?: (content: string, metadata?: { final?: boolean }) => void
   onProgressMessage?: (content: string) => void
-  onTurnDiags?: (info: TurnDiagInfo) => void
+  onTurnDiags?: (info: TurnDiagInfo) => void  
 }): Promise<ChatMessage[]> {
   const messages = args.messages
   const maxSteps = args.maxSteps ?? 30
   const added: ChatMessage[] = []
   const callCounts = new Map<string, number>()
-
+  //append 这个函数使用都是添加上下文的操作
   const append = (...items: ChatMessage[]): void => {
     for (const item of items) {
       const content = (item as { content?: string }).content
@@ -95,7 +101,7 @@ export async function agentloop(args: {
       const isProgress = response.kind === 'progress'
 
       appendThinkingBlocks(response.thinkingBlocks)
-
+//progress 中间态：只作提示展示，不视为回合的最终回复
       if (!isEmpty && isProgress) {
         args.onProgressMessage?.(response.content)
         append({ role: 'assistant_progress', content: response.content })
@@ -126,6 +132,7 @@ export async function agentloop(args: {
       if (response.content && response.contentKind !== 'progress') {
         appendThinkingBlocks(response.thinkingBlocks)
         append({ role: 'assistant_progress', content: response.content })
+        args.onProgressMessage?.(response.content)
         args.onTurnDiags?.({
           step,
           kind: 'empty',
@@ -168,10 +175,13 @@ export async function agentloop(args: {
         toolName: call.toolName,
         content: output,
         isError: !result.ok || count >= LOOP_GUARD_AFTER_REPEATS,
-      }, undefined))
+        //toolResultState：按 toolUseId 记忆已发生的替换，跨请求字节级稳定复放 + 批量预算
+      }, args.toolResultState))
     }
-
-    append(...toolResults)
+    const budgeted  = args.toolResultState
+    ?await applyToolResultBudget(toolResults,args.toolResultState)
+    :{results:toolResults}
+    append(...budgeted.results)
     args.onTurnDiags?.({
       step,
       kind: 'tools',
@@ -182,9 +192,8 @@ export async function agentloop(args: {
   }
 
   args.onTurnDiags?.({ step: maxSteps, kind: 'max_steps' })
-  append({
-    role: 'assistant',
-    content: `达到最大工具步数限制（${maxSteps}），已停止当前回合。`,
-  })
+  const maxStepsNotice = `达到最大工具步数限制（${maxSteps}），已停止当前回合。`
+  args.onAssistantMessage?.(maxStepsNotice, { final: true })
+  append({ role: 'assistant', content: maxStepsNotice })
   return added
 }

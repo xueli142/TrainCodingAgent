@@ -2,6 +2,7 @@ export async function buildSystemPrompt(
   cwd: string,
   permissionSummary: string[] = [],
   environmentLines: string[] = [],
+  skillBlock?: string,
 ): Promise<string> {
   const parts = [
     'You are a helpful coding assistant with access to local file system tools.',
@@ -15,6 +16,9 @@ export async function buildSystemPrompt(
   ]
   if (permissionSummary.length > 0) {
     parts.push(`Permission context:\n${permissionSummary.join('\n')}`)
+  }
+  if (skillBlock) {
+    parts.push(skillBlock)
   }
   return parts.join('\n\n')
 }

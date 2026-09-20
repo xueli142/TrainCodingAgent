@@ -194,7 +194,10 @@ export async function replaceLargeToolResult(
     content: replacement,
   }
 }
-
+//对一批工具调用结果（PendingToolResult[]）做“体积预算”控制，
+// 超出限制时把大的结果持久化到外部存储，
+// 并用一条简短的“已持久化”消息替换原内容，
+// 从而避免一次性把太多内容塞进上下文。
 export async function applyToolResultBudget(
   results: PendingToolResult[],
   state: ContentReplacementState,

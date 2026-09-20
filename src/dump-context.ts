@@ -23,7 +23,8 @@ const messages: ChatMessage[] = [
 
 console.log('############ raw ChatMessage[] (本地存储形态) ############')
 for (const m of messages) {
-  console.log(`- role=${m.role}  ${m.content.length} chars`)
+  const chars = 'content' in m ? String(m.content).length : 0
+  console.log(`- role=${m.role}  ${chars} chars`)
 }
 
 const payload = toAnthropicMessages(messages)

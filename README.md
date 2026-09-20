@@ -16,7 +16,7 @@
 - 🌱 **环境探针** —— 进程/项目环境（平台、shell、git 根、trust 状态）注入系统提示
 - 🔍 **上下文追踪** —— **默认开启**：每轮发给模型的完整请求（system/messages/tools）落盘 `traces/`，`inspect-trace` 离线回看与 diff；`ICEFOX_TRACE=0` 关闭
 - 🧩 **思考块与进度标记** —— 保留 provider thinking 块，识别 `<progress>` / `[PROGRESS]` 中间态
-- 🔐 **权限约束层** —— 编辑/危险命令/越界的交互式审批卡（控制台直读，不抢 REPL 的 stdin）、系统级拒绝的 bash 绕行硬闸、危险命令分类（详见「安全与权限」）
+- 🔐 **权限约束层** —— 编辑/危险命令/越界的交互式审批卡（复用主 readline 单读者分发，审批卡与 question 排队串行）、系统级拒绝的 bash 绕行硬闸、危险命令分类（详见「安全与权限」）
 
 ## 快速开始
 
@@ -65,21 +65,22 @@ $env:ICEFOX_TRACE = '0'; pnpm start
 
 > **agentloop 合约（勿回退）**：所有新消息**就地 push 进调用方共享的 `messages` 数组**（回合中途调度器即可见、
 > 崩溃窗口 ≤1s）；返回值是**仅新增的增量**，调用方不得再 push 回同一数组（历史曾因此重复、诱发模型连环重试）。
-> `question` 与 `task` 两个工具支持宿主注入处理器（`setQuestionHandler` / `setTaskExecutor`），未注入时返回引导文案而非崩溃。
+> `question` 与 `task` 支持宿主注入处理器（`setQuestionHandler` / `setTaskExecutor`）；`question` 已在 `index.ts` 接线
+> （经单读者 `readLine` 就地交互），`task` 未注入时返回引导文案而非崩溃。
 
 ## 项目结构
 
 ```
 src/
-├─ index.ts              # 入口：REPL、会话恢复/切换、压缩触发、trace 开关
+├─ index.ts              # 入口：REPL（单读者读行）、会话恢复/切换、压缩触发、trace 开关、技能注入、question 接线
 ├─ agent_loop.ts         # ★ 主循环：模型 → 工具 → 回灌 → 再请求
 ├─ anthropic-adapter.ts  # 模型适配器（Anthropic 协议；thinking/progress 解析、trace 埋点、message 折叠）
 ├─ prompt.ts             # 系统提示词（cwd + 环境块 + 权限摘要）
 ├─ type.ts               # ChatMessage / AgentStep / ModelAdapter 等类型
 ├─ tool.ts               # ToolDefinition / ToolResult / ToolRegistry
- ├─ permissionManager.ts  # 权限决策（path / command / edit，持久化 permissions.json，isEditDenied 绕行检查）
+ ├─ permissionManager.ts  # 权限决策（path / command / edit；持久化 permissions.json；allow_once 无记忆；isEditDenied 绕行检查）
  ├─ permissionUi.ts       # 交互式审批卡（渲染 PermissionRequest 七选项，deny_with_feedback 采集用户指引）
- ├─ tty-prompt.ts         # 控制台直读（Windows CONIN$ / POSIX /dev/tty），不与主 readline 抢 stdin
+ ├─ tty-prompt.ts         # 单读者模态分发（attachInputSource/readLine）：主 rl 唯一 stdin 读者，审批卡/question 排队
 ├─ session.ts            # 事件溯源会话存储 + 投影（projectMessages）
 ├─ compact.ts            # 上下文压缩（estimateTokens / maybeCompactContext）
 ├─ environment.ts        # 进程环境 / 项目环境 / trust.json
@@ -101,7 +102,7 @@ src/
 │  └─ read_file.ts / list_file.ts / run_command.ts / search_file.ts / write_file.ts   # 早期遗留，未注册
 └─ utils/
    ├─ errors.ts          # ENOENT 判断等
-   └─ tool-result.ts     # 超长工具输出落盘 + 预览
+   └─ tool-result.ts     # 超长工具输出落盘 + 预览 + 批量预算（applyToolResultBudget）
 ```
 
 ## 工具集
@@ -115,8 +116,8 @@ src/
 | `glob`      | 按文件名模式匹配（最多 100 条，按修改时间倒序）                     |
 | `grep`      | 按内容正则搜索（最多 200 条匹配）                                   |
 | `todowrite` | 维护任务列表（全量替换，`in_progress` 至多一条）                  |
-| `question`  | 向用户提问（**未接线**）                                      |
-| `skill`     | 从`.icefox/skills` 或 `~/.ICEFOX-code/skills` 加载 `SKILL.md` |
+| `question`  | 向用户提问（选项/自由文本，经单读者 readLine 就地交互）                |
+| `skill`     | 从`.icefox/skills` 或 `~/.ICEFOX-code/skills` 加载 `SKILL.md`；技能摘要（name/description）注入系统提示，body 按需加载 |
 | `task`      | 派发子任务（**未接线**）                                      |
 | `webfetch`  | 抓取网页并转纯文本，超长截断                                        |
 
@@ -172,13 +173,15 @@ npx tsx src/dump-context.ts
 
 四层机制（人的通道 = 审批卡；模型的通道 = 文案+硬闸+规则，两条都要有，只做一条会被绕过）：
 
-- **三闸 × 四层记忆**（`permissionManager.ts`，与 MiniCode 同构）：
+- **三闸 × 分层记忆**（`permissionManager.ts`，与 MiniCode 同构）：
   - path：workspace 内自动放行；越界弹卡（allow once / 永久允许目录 / 拒绝…），作用域自动收缩到父目录
   - command：危险分类表（`git reset --hard` / `clean` / `push -f`、`npm publish`、`node`/`python`/`sh` 任意代码执行）命中才弹卡，其余静默放行
   - edit：永远弹卡，7 选项（单次 / 本回合此文件 / 本回合全部 / 永久此文件 / 拒 / 拒+用户反馈 / 永久拒）；diff 即审批界面
-  - 记忆层级：持久化（`permissions.json`）＞ 进程 session ＞ 回合 turn（`beginTurn`/`endTurn` 由 index 包住每轮）＞ 一次性
-- **交互式审批卡**（`permissionUi.ts` + `tty-prompt.ts`）：独立打开控制台输入（Windows `CONIN$` / POSIX `/dev/tty`），
-  阻塞式单行读——绕开主 readline 的 stdin 占用，回合中途弹卡不互踩；拿不到控制台时自动 deny_once
+  - 记忆层级：**允许** = 持久化（`permissions.json`）＞ 回合 turn（`beginTurn`/`endTurn` 由 index 包住每轮，仅 edit）＞ 一次性；**拒绝** = 持久化 ＞ 进程 session ＞ 一次性
+  - `allow_once` 是**真·一次性**：只放行当次，不写入任何记忆层，下次同类操作仍会弹卡
+- **交互式审批卡**（`permissionUi.ts` + `tty-prompt.ts`）：主 readline 是唯一 stdin 读者，审批卡与 `question`
+  通过 `readLine` 队列串行复用同一条输入流（不再单独打开 `CONIN$` / `/dev/tty`）；输入流关闭（EOF / 管道）
+  时审批自动 `deny_once`，`question` 返回 `ok:false` 让模型改用纯文本提问
 - **拒绝不可绕过**（bash 绕行硬闸，`tools/tool/bash.ts gateTouchedPaths`）：
   - 从整条命令行抽取路径候选（引号绝对路径 / 裸盘符路径 / `..` 相对路径）
   - 越出 workspace → 与 write 走**同一把 path 闸**（同一张卡、同一份拒绝记忆）
@@ -190,17 +193,15 @@ npx tsx src/dump-context.ts
 
 ## 技术栈
 
-- **运行时**：Node.js + TypeScript（ES2022 / NodeNext）
+- **运行时**：Node.js + TypeScript（target ES2022 / lib ES2023 / NodeNext）
 - **执行**：`tsx` 直接运行 TS，无构建步骤
 - **模型**：Anthropic 兼容协议（默认指向 DeepSeek）
 - **依赖**：`zod`（工具入参校验 + JSON Schema 生成）、`diff`（编辑 diff）
 
 ## 已知问题与待办
 
-- ⚠️ `anthropic-adapter.ts` 里 API Key 与 `BASE_URL` 硬编码，且 `config.ts` 的 `RuntimeConfig` 未被使用 —— 应改读环境变量
-- `question`、`task` 工具未接线（`setQuestionHandler` / `setTaskExecutor` 未被调用）
-- `skill` 的 `available_skills` 未注入系统提示（`formatSkillsForPrompt` 未被调用），模型只能猜技能名
-- 工具结果的**批量预算**（`utils/tool-result.ts` 的 `applyToolResultBudget`）尚未接入 `agent_loop`
+- `config.ts` 的 `RuntimeConfig` 类型定义后未被使用（`MODEL` / `API_KEY` / `BASE_URL` 已走环境变量 + dotenv，见 `.env`）
+- `task` 工具仍未接线（`setTaskExecutor` 未被调用）；`question` 已接线（`index.ts` 注册 `setQuestionHandler`，经单读者 `readLine` 交互）
 - progress 判定只认显式 `kind==='progress'`（推断式启发曾把工具轮后的正常完成误判为进度、诱发连环重复调用，已删）；若需要更智能的续跑判断，重新设计而非回退启发式
 - 遗留/空文件可清理：`checkroute.ts`、`register.ts`（空）、`src/text/`（空）、`src/tools/` 顶层的旧工具、`test-tool.ts`（引用旧路径）
 - 工程配置：`package.json` 的 `name` 仍是 `claude-cli`，`check-deps` 指向不存在的 `scripts/check-deps.js`，`inspect-trace` 提示的 `pnpm dev` 脚本不存在

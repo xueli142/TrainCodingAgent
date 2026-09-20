@@ -2,7 +2,7 @@ import type {
   PermissionPromptHandler,
   PermissionRequest,
 } from './permissionManager.js'
-import { readLineFromConsole } from './tty-prompt.js'
+import { readLine } from './tty-prompt.js'
 
 export function createPermissionPromptHandler(): PermissionPromptHandler {
   return async (request: PermissionRequest) => {
@@ -16,7 +16,7 @@ export function createPermissionPromptHandler(): PermissionPromptHandler {
     console.log(lines.join('\n'))
 
     for (let attempt = 0; attempt < 3; attempt++) {
-      const answer = readLineFromConsole('choose> ')
+      const answer = await readLine('choose> ')
       if (answer === null) {
         return { decision: 'deny_once' }
       }
@@ -26,7 +26,8 @@ export function createPermissionPromptHandler(): PermissionPromptHandler {
         continue
       }
       if (chosen.decision === 'deny_with_feedback') {
-        const feedback = readLineFromConsole('guidance to model> ') ?? ''
+        //readLine 返回 Promise<string | null>：await 取值，EOF 兜底成空反馈
+        const feedback = (await readLine('guidance to model> '))?.trim() ?? ''
         return { decision: chosen.decision, feedback }
       }
       return { decision: chosen.decision }

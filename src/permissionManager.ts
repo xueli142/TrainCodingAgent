@@ -1,508 +1,498 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import path from 'node:path'
-import { ICEFOX_CODE_DIR } from './config.js'
-import { isEnoentError } from './utils/errors.js'
-//权限管理器
-export type PermissionDecision =
-  | 'allow_once'
-  | 'allow_always'
-  | 'allow_turn'
-  | 'allow_all_turn'
-  | 'deny_once'
-  | 'deny_always'
-  | 'deny_with_feedback'
+  import { mkdir, readFile, writeFile } from 'node:fs/promises'
+  import path from 'node:path'
+  import { ICEFOX_CODE_DIR } from './config.js'
+  import { isEnoentError } from './utils/errors.js'
+  //权限管理器
+  export type PermissionDecision =
+    | 'allow_once'
+    | 'allow_always'
+    | 'allow_turn'
+    | 'allow_all_turn'
+    | 'deny_once'
+    | 'deny_always'
+    | 'deny_with_feedback'
 
-export type PermissionChoice = {
-  key: string
-  label: string
-  decision: PermissionDecision
-}
-
-export type PermissionPromptResult = {
-  decision: PermissionDecision
-  feedback?: string
-}
-
-type EnsureCommandOptions = {
-  forcePromptReason?: string
-}
-
-export type PermissionRequest = {
-  kind: 'path' | 'command' | 'edit'
-  summary: string
-  details: string[]
-  scope: string
-  choices: PermissionChoice[]
-}
-
-export type PermissionPromptHandler = (
-  request: PermissionRequest,
-) => Promise<PermissionPromptResult>
-
-type PermissionStore = {
-  allowedDirectoryPrefixes?: string[]
-  deniedDirectoryPrefixes?: string[]
-  allowedCommandPatterns?: string[]
-  deniedCommandPatterns?: string[]
-  allowedEditPatterns?: string[]
-  deniedEditPatterns?: string[]
-}
-
-type PathIntent = 'read' | 'write' | 'list' | 'search' | 'command_cwd'
-
-const PERMISSIONS_PATH = path.join(ICEFOX_CODE_DIR, 'permissions.json')
-
-function normalizePath(targetPath: string): string {
-  return path.resolve(targetPath)
-}
-
-function isWithinDirectory(root: string, target: string): boolean {
-  const relative = path.relative(root, target)
-  return (
-    relative === '' ||
-    (!relative.startsWith(`..${path.sep}`) &&
-      relative !== '..' &&
-      !path.isAbsolute(relative))
-  )
-}
-
-function matchesDirectoryPrefix(
-  targetPath: string,
-  directories: Iterable<string>,
-): boolean {
-  for (const directory of directories) {
-    if (isWithinDirectory(directory, targetPath)) {
-      return true
-    }
+  export type PermissionChoice = {
+    key: string
+    label: string
+    decision: PermissionDecision
   }
 
-  return false
-}
+  export type PermissionPromptResult = {
+    decision: PermissionDecision
+    feedback?: string
+  }
 
-function formatCommandSignature(command: string, args: string[]): string {
-  return [command, ...args].join(' ').trim()
-}
+  type EnsureCommandOptions = {
+    forcePromptReason?: string
+  }
 
-function classifyDangerousCommand(command: string, args: string[]): string | null {
-  const normalizedArgs = args.map(arg => arg.trim()).filter(Boolean)
-  const signature = formatCommandSignature(command, normalizedArgs)
+  export type PermissionRequest = {
+    kind: 'path' | 'command' | 'edit'
+    summary: string
+    details: string[]
+    scope: string
+    choices: PermissionChoice[]
+  }
 
-  if (command === 'git') {
-    if (normalizedArgs.includes('reset') && normalizedArgs.includes('--hard')) {
-      return `git reset --hard can discard local changes (${signature})`
+  export type PermissionPromptHandler = (
+    request: PermissionRequest,
+  ) => Promise<PermissionPromptResult>
+
+  type PermissionStore = {
+    allowedDirectoryPrefixes?: string[]
+    deniedDirectoryPrefixes?: string[]
+    allowedCommandPatterns?: string[]
+    deniedCommandPatterns?: string[]
+    allowedEditPatterns?: string[]
+    deniedEditPatterns?: string[]
+  }
+
+  type PathIntent = 'read' | 'write' | 'list' | 'search' | 'command_cwd'
+
+  const PERMISSIONS_PATH = path.join(ICEFOX_CODE_DIR, 'permissions.json')
+
+  function normalizePath(targetPath: string): string {
+    return path.resolve(targetPath)
+  }
+
+  function isWithinDirectory(root: string, target: string): boolean {
+    const relative = path.relative(root, target)
+    return (
+      relative === '' ||
+      (!relative.startsWith(`..${path.sep}`) &&
+        relative !== '..' &&
+        !path.isAbsolute(relative))
+    )
+  }
+
+  function matchesDirectoryPrefix(
+    targetPath: string,
+    directories: Iterable<string>,
+  ): boolean {
+    for (const directory of directories) {
+      if (isWithinDirectory(directory, targetPath)) {
+        return true
+      }
     }
 
-    if (normalizedArgs.includes('clean')) {
-      return `git clean can delete untracked files (${signature})`
+    return false
+  }
+
+  function formatCommandSignature(command: string, args: string[]): string {
+    return [command, ...args].join(' ').trim()
+  }
+
+  function classifyDangerousCommand(command: string, args: string[]): string | null {
+    const normalizedArgs = args.map(arg => arg.trim()).filter(Boolean)
+    const signature = formatCommandSignature(command, normalizedArgs)
+
+    if (command === 'git') {
+      if (normalizedArgs.includes('reset') && normalizedArgs.includes('--hard')) {
+        return `git reset --hard can discard local changes (${signature})`
+      }
+
+      if (normalizedArgs.includes('clean')) {
+        return `git clean can delete untracked files (${signature})`
+      }
+
+      if (
+        normalizedArgs.includes('checkout') &&
+        normalizedArgs.includes('--')
+      ) {
+        return `git checkout -- can overwrite working tree files (${signature})`
+      }
+
+      if (
+        normalizedArgs.includes('restore') &&
+        normalizedArgs.some(arg => arg.startsWith('--source'))
+      ) {
+        return `git restore --source can overwrite local files (${signature})`
+      }
+
+      if (
+        normalizedArgs.includes('push') &&
+        normalizedArgs.some(arg => arg === '--force' || arg === '-f')
+      ) {
+        return `git push --force rewrites remote history (${signature})`
+      }
+    }
+
+    if (command === 'npm' && normalizedArgs.includes('publish')) {
+      return `npm publish affects a registry outside this machine (${signature})`
     }
 
     if (
-      normalizedArgs.includes('checkout') &&
-      normalizedArgs.includes('--')
+      command === 'node' ||
+      command === 'python3' ||
+      command === 'bun' ||
+      command === 'bash' ||
+      command === 'sh'
     ) {
-      return `git checkout -- can overwrite working tree files (${signature})`
+      return `${command} can execute arbitrary local code (${signature})`
     }
 
-    if (
-      normalizedArgs.includes('restore') &&
-      normalizedArgs.some(arg => arg.startsWith('--source'))
-    ) {
-      return `git restore --source can overwrite local files (${signature})`
-    }
+    return null
+  }
 
-    if (
-      normalizedArgs.includes('push') &&
-      normalizedArgs.some(arg => arg === '--force' || arg === '-f')
-    ) {
-      return `git push --force rewrites remote history (${signature})`
+  async function readPermissionStore(): Promise<PermissionStore> {
+    try {
+      const content = await readFile(PERMISSIONS_PATH, 'utf8')
+      return JSON.parse(content) as PermissionStore
+    } catch (error) {
+      if (isEnoentError(error)) {
+        return {}
+      }
+
+      throw error
     }
   }
 
-  if (command === 'npm' && normalizedArgs.includes('publish')) {
-    return `npm publish affects a registry outside this machine (${signature})`
+  async function writePermissionStore(store: PermissionStore): Promise<void> {
+    await mkdir(ICEFOX_CODE_DIR, { recursive: true })
+    await writeFile(PERMISSIONS_PATH, `${JSON.stringify(store, null, 2)}\n`, 'utf8')
   }
 
-  if (
-    command === 'node' ||
-    command === 'python3' ||
-    command === 'bun' ||
-    command === 'bash' ||
-    command === 'sh'
-  ) {
-    return `${command} can execute arbitrary local code (${signature})`
-  }
-
-  return null
-}
-
-async function readPermissionStore(): Promise<PermissionStore> {
-  try {
-    const content = await readFile(PERMISSIONS_PATH, 'utf8')
-    return JSON.parse(content) as PermissionStore
-  } catch (error) {
-    if (isEnoentError(error)) {
-      return {}
-    }
-
-    throw error
-  }
-}
-
-async function writePermissionStore(store: PermissionStore): Promise<void> {
-  await mkdir(ICEFOX_CODE_DIR, { recursive: true })
-  await writeFile(PERMISSIONS_PATH, `${JSON.stringify(store, null, 2)}\n`, 'utf8')
-}
-
-export class PermissionManager {
-  private readonly allowedDirectoryPrefixes = new Set<string>()
-  private readonly deniedDirectoryPrefixes = new Set<string>()
-  private readonly sessionAllowedPaths = new Set<string>()
+  export class PermissionManager {
+    private readonly allowedDirectoryPrefixes = new Set<string>()
+    private readonly deniedDirectoryPrefixes = new Set<string>()
   private readonly sessionDeniedPaths = new Set<string>()
-  private readonly allowedCommandPatterns = new Set<string>()
-  private readonly deniedCommandPatterns = new Set<string>()
-  private readonly sessionAllowedCommands = new Set<string>()
+    private readonly allowedCommandPatterns = new Set<string>()
+    private readonly deniedCommandPatterns = new Set<string>()
   private readonly sessionDeniedCommands = new Set<string>()
-  private readonly allowedEditPatterns = new Set<string>()
-  private readonly deniedEditPatterns = new Set<string>()
-  private readonly sessionAllowedEdits = new Set<string>()
+    private readonly allowedEditPatterns = new Set<string>()
+    private readonly deniedEditPatterns = new Set<string>()
   private readonly sessionDeniedEdits = new Set<string>()
-  private readonly turnAllowedEdits = new Set<string>()
-  private turnAllowAllEdits = false
-  private ready: Promise<void>
+    private readonly turnAllowedEdits = new Set<string>()
+    private turnAllowAllEdits = false
+    private ready: Promise<void>
 
-  constructor(
-    private readonly workspaceRoot: string,
-    private readonly prompt?: PermissionPromptHandler,
-  ) {
-    this.ready = this.initialize()
-  }
-
-  private async initialize(): Promise<void> {
-    const store = await readPermissionStore()
-
-    for (const directory of store.allowedDirectoryPrefixes ?? []) {
-      this.allowedDirectoryPrefixes.add(normalizePath(directory))
+    constructor(
+      private readonly workspaceRoot: string,
+      private readonly prompt?: PermissionPromptHandler,
+    ) {
+      this.ready = this.initialize()
     }
 
-    for (const directory of store.deniedDirectoryPrefixes ?? []) {
-      this.deniedDirectoryPrefixes.add(normalizePath(directory))
+    private async initialize(): Promise<void> {
+      const store = await readPermissionStore()
+
+      for (const directory of store.allowedDirectoryPrefixes ?? []) {
+        this.allowedDirectoryPrefixes.add(normalizePath(directory))
+      }
+
+      for (const directory of store.deniedDirectoryPrefixes ?? []) {
+        this.deniedDirectoryPrefixes.add(normalizePath(directory))
+      }
+
+      for (const pattern of store.allowedCommandPatterns ?? []) {
+        this.allowedCommandPatterns.add(pattern)
+      }
+
+      for (const pattern of store.deniedCommandPatterns ?? []) {
+        this.deniedCommandPatterns.add(pattern)
+      }
+
+      for (const pattern of store.allowedEditPatterns ?? []) {
+        this.allowedEditPatterns.add(normalizePath(pattern))
+      }
+
+      for (const pattern of store.deniedEditPatterns ?? []) {
+        this.deniedEditPatterns.add(normalizePath(pattern))
+      }
     }
 
-    for (const pattern of store.allowedCommandPatterns ?? []) {
-      this.allowedCommandPatterns.add(pattern)
+    async whenReady(): Promise<void> {
+      await this.ready
     }
 
-    for (const pattern of store.deniedCommandPatterns ?? []) {
-      this.deniedCommandPatterns.add(pattern)
+    beginTurn(): void {
+      this.turnAllowedEdits.clear()
+      this.turnAllowAllEdits = false
     }
 
-    for (const pattern of store.allowedEditPatterns ?? []) {
-      this.allowedEditPatterns.add(normalizePath(pattern))
+    /** bash 绕行硬闸用：该目标是否已被拒绝（session 级或持久化） */
+    async isEditDenied(targetPath: string): Promise<boolean> {
+      await this.ready
+      const normalizedTarget = normalizePath(targetPath)
+      return this.sessionDeniedEdits.has(normalizedTarget) || this.deniedEditPatterns.has(normalizedTarget)
     }
 
-    for (const pattern of store.deniedEditPatterns ?? []) {
-      this.deniedEditPatterns.add(normalizePath(pattern))
-    }
-  }
-
-  async whenReady(): Promise<void> {
-    await this.ready
-  }
-
-  beginTurn(): void {
-    this.turnAllowedEdits.clear()
-    this.turnAllowAllEdits = false
-  }
-
-  /** bash 绕行硬闸用：该目标是否已被拒绝（session 级或持久化） */
-  async isEditDenied(targetPath: string): Promise<boolean> {
-    await this.ready
-    const normalizedTarget = normalizePath(targetPath)
-    return this.sessionDeniedEdits.has(normalizedTarget) || this.deniedEditPatterns.has(normalizedTarget)
-  }
-
-  endTurn(): void {
-    this.turnAllowedEdits.clear()
-    this.turnAllowAllEdits = false
-  }
-
-  getSummary(): string[] {
-    const summary = [`cwd: ${this.workspaceRoot}`]
-
-    if (this.allowedDirectoryPrefixes.size > 0) {
-      summary.push(
-        `extra allowed dirs: ${[...this.allowedDirectoryPrefixes].slice(0, 4).join(', ')}`,
-      )
-    } else {
-      summary.push('extra allowed dirs: none')
+    endTurn(): void {
+      this.turnAllowedEdits.clear()
+      this.turnAllowAllEdits = false
     }
 
-    if (this.allowedCommandPatterns.size > 0) {
-      summary.push(
-        `dangerous allowlist: ${[...this.allowedCommandPatterns].slice(0, 4).join(', ')}`,
-      )
-    } else {
-      summary.push('dangerous allowlist: none')
+    getSummary(): string[] {
+      const summary = [`cwd: ${this.workspaceRoot}`]
+
+      if (this.allowedDirectoryPrefixes.size > 0) {
+        summary.push(
+          `extra allowed dirs: ${[...this.allowedDirectoryPrefixes].slice(0, 4).join(', ')}`,
+        )
+      } else {
+        summary.push('extra allowed dirs: none')
+      }
+
+      if (this.allowedCommandPatterns.size > 0) {
+        summary.push(
+          `dangerous allowlist: ${[...this.allowedCommandPatterns].slice(0, 4).join(', ')}`,
+        )
+      } else {
+        summary.push('dangerous allowlist: none')
+      }
+
+      if (this.allowedEditPatterns.size > 0) {
+        summary.push(
+          `trusted edit targets: ${[...this.allowedEditPatterns].slice(0, 2).join(', ')}`,
+        )
+      }
+
+      return summary
     }
 
-    if (this.allowedEditPatterns.size > 0) {
-      summary.push(
-        `trusted edit targets: ${[...this.allowedEditPatterns].slice(0, 2).join(', ')}`,
-      )
+    private async persist(): Promise<void> {
+      await writePermissionStore({
+        allowedDirectoryPrefixes: [...this.allowedDirectoryPrefixes],
+        deniedDirectoryPrefixes: [...this.deniedDirectoryPrefixes],
+        allowedCommandPatterns: [...this.allowedCommandPatterns],
+        deniedCommandPatterns: [...this.deniedCommandPatterns],
+        allowedEditPatterns: [...this.allowedEditPatterns],
+        deniedEditPatterns: [...this.deniedEditPatterns],
+      })
     }
 
-    return summary
-  }
+    async ensurePathAccess(targetPath: string, intent: PathIntent): Promise<void> {
+      await this.ready
 
-  private async persist(): Promise<void> {
-    await writePermissionStore({
-      allowedDirectoryPrefixes: [...this.allowedDirectoryPrefixes],
-      deniedDirectoryPrefixes: [...this.deniedDirectoryPrefixes],
-      allowedCommandPatterns: [...this.allowedCommandPatterns],
-      deniedCommandPatterns: [...this.deniedCommandPatterns],
-      allowedEditPatterns: [...this.allowedEditPatterns],
-      deniedEditPatterns: [...this.deniedEditPatterns],
-    })
-  }
+      const normalizedTarget = normalizePath(targetPath)
+      if (isWithinDirectory(this.workspaceRoot, normalizedTarget)) {
+        return
+      }
 
-  async ensurePathAccess(targetPath: string, intent: PathIntent): Promise<void> {
-    await this.ready
+      if (
+        this.sessionDeniedPaths.has(normalizedTarget) ||
+        matchesDirectoryPrefix(normalizedTarget, this.deniedDirectoryPrefixes)
+      ) {
+        throw new Error(`Access denied for path outside cwd: ${normalizedTarget}`)
+      }
 
-    const normalizedTarget = normalizePath(targetPath)
-    if (isWithinDirectory(this.workspaceRoot, normalizedTarget)) {
+    if (matchesDirectoryPrefix(normalizedTarget, this.allowedDirectoryPrefixes)) {
       return
     }
 
-    if (
-      this.sessionDeniedPaths.has(normalizedTarget) ||
-      matchesDirectoryPrefix(normalizedTarget, this.deniedDirectoryPrefixes)
-    ) {
-      throw new Error(`Access denied for path outside cwd: ${normalizedTarget}`)
-    }
+      if (!this.prompt) {
+        throw new Error(
+          `Path ${normalizedTarget} is outside cwd ${this.workspaceRoot} and NO interactive approval is available right now. Hard restriction: do not attempt this access through bash redirection, shell writes, or any other tool. Stop and tell the user; only they can grant it.`,
+        )
+      }
 
-    if (
-      this.sessionAllowedPaths.has(normalizedTarget) ||
-      matchesDirectoryPrefix(normalizedTarget, this.allowedDirectoryPrefixes)
-    ) {
-      return
-    }
+      const scopeDirectory =
+        intent === 'list' || intent === 'command_cwd'
+          ? normalizedTarget
+          : path.dirname(normalizedTarget)
 
-    if (!this.prompt) {
-      throw new Error(
-        `Path ${normalizedTarget} is outside cwd ${this.workspaceRoot} and NO interactive approval is available right now. Hard restriction: do not attempt this access through bash redirection, shell writes, or any other tool. Stop and tell the user; only they can grant it.`,
-      )
-    }
-
-    const scopeDirectory =
-      intent === 'list' || intent === 'command_cwd'
-        ? normalizedTarget
-        : path.dirname(normalizedTarget)
-
-    const promptResult = await this.prompt({
-      kind: 'path',
-      summary: `ICEFOX-code wants ${intent.replace('_', ' ')} access outside the current cwd`,
-      details: [
-        `cwd: ${this.workspaceRoot}`,
-        `target: ${normalizedTarget}`,
-        `scope directory: ${scopeDirectory}`,
-      ],
-      scope: scopeDirectory,
-      choices: [
-        { key: 'y', label: 'allow once', decision: 'allow_once' },
-        { key: 'a', label: 'allow this directory', decision: 'allow_always' },
-        { key: 'n', label: 'deny once', decision: 'deny_once' },
-        { key: 'd', label: 'deny this directory', decision: 'deny_always' },
-      ],
-    })
+      const promptResult = await this.prompt({
+        kind: 'path',
+        summary: `ICEFOX-code wants ${intent.replace('_', ' ')} access outside the current cwd`,
+        details: [
+          `cwd: ${this.workspaceRoot}`,
+          `target: ${normalizedTarget}`,
+          `scope directory: ${scopeDirectory}`,
+        ],
+        scope: scopeDirectory,
+        choices: [
+          { key: 'y', label: 'allow once', decision: 'allow_once' },
+          { key: 'a', label: 'allow this directory', decision: 'allow_always' },
+          { key: 'n', label: 'deny once', decision: 'deny_once' },
+          { key: 'd', label: 'deny this directory', decision: 'deny_always' },
+        ],
+      })
 
     if (promptResult.decision === 'allow_once') {
-      this.sessionAllowedPaths.add(normalizedTarget)
+      // 真·一次性：不写入任何记忆层，下次同类操作仍会弹卡
       return
     }
 
     if (promptResult.decision === 'allow_always') {
       this.allowedDirectoryPrefixes.add(scopeDirectory)
-      await this.persist()
-      return
+        await this.persist()
+        return
+      }
+
+      if (promptResult.decision === 'deny_always') {
+        this.deniedDirectoryPrefixes.add(scopeDirectory)
+        await this.persist()
+      } else {
+        this.sessionDeniedPaths.add(normalizedTarget)
+      }
+
+      throw new Error(`Access denied for path outside cwd: ${normalizedTarget}`)
     }
 
-    if (promptResult.decision === 'deny_always') {
-      this.deniedDirectoryPrefixes.add(scopeDirectory)
-      await this.persist()
-    } else {
-      this.sessionDeniedPaths.add(normalizedTarget)
-    }
+    async ensureCommand(
+      command: string,
+      args: string[],
+      commandCwd: string,
+      options?: EnsureCommandOptions,
+    ): Promise<void> {
+      await this.ready
 
-    throw new Error(`Access denied for path outside cwd: ${normalizedTarget}`)
-  }
+      await this.ensurePathAccess(commandCwd, 'command_cwd')
 
-  async ensureCommand(
-    command: string,
-    args: string[],
-    commandCwd: string,
-    options?: EnsureCommandOptions,
-  ): Promise<void> {
-    await this.ready
+      const dangerousReason = classifyDangerousCommand(command, args)
+      const reason = options?.forcePromptReason?.trim() || dangerousReason
+      if (!reason) {
+        return
+      }
 
-    await this.ensurePathAccess(commandCwd, 'command_cwd')
+      const signature = formatCommandSignature(command, args)
+      if (
+        this.sessionDeniedCommands.has(signature) ||
+        this.deniedCommandPatterns.has(signature)
+      ) {
+        throw new Error(`Command denied: ${signature}`)
+      }
 
-    const dangerousReason = classifyDangerousCommand(command, args)
-    const reason = options?.forcePromptReason?.trim() || dangerousReason
-    if (!reason) {
-      return
-    }
+      if (this.allowedCommandPatterns.has(signature)) {
+        return
+      }
 
-    const signature = formatCommandSignature(command, args)
-    if (
-      this.sessionDeniedCommands.has(signature) ||
-      this.deniedCommandPatterns.has(signature)
-    ) {
-      throw new Error(`Command denied: ${signature}`)
-    }
+      if (!this.prompt) {
+        throw new Error(
+          `Command requires approval but no interactive approver is available: ${signature}. Hard restriction: do not retry through alternative commands, interpreters, or shell forms. Explain the block to the user and ask them to run it.`,
+        )
+      }
 
-    if (
-      this.sessionAllowedCommands.has(signature) ||
-      this.allowedCommandPatterns.has(signature)
-    ) {
-      return
-    }
-
-    if (!this.prompt) {
-      throw new Error(
-        `Command requires approval but no interactive approver is available: ${signature}. Hard restriction: do not retry through alternative commands, interpreters, or shell forms. Explain the block to the user and ask them to run it.`,
-      )
-    }
-
-    const promptResult = await this.prompt({
-      kind: 'command',
-      summary: options?.forcePromptReason
-        ? 'ICEFOX-code wants approval for this command'
-        : 'ICEFOX-code wants to run a dangerous command',
-      details: [
-        `cwd: ${commandCwd}`,
-        `command: ${signature}`,
-        `reason: ${reason}`,
-      ],
-      scope: signature,
-      choices: [
-        { key: 'y', label: 'allow once', decision: 'allow_once' },
-        { key: 'a', label: 'always allow this command', decision: 'allow_always' },
-        { key: 'n', label: 'deny once', decision: 'deny_once' },
-        { key: 'd', label: 'always deny this command', decision: 'deny_always' },
-      ],
-    })
+      const promptResult = await this.prompt({
+        kind: 'command',
+        summary: options?.forcePromptReason
+          ? 'ICEFOX-code wants approval for this command'
+          : 'ICEFOX-code wants to run a dangerous command',
+        details: [
+          `cwd: ${commandCwd}`,
+          `command: ${signature}`,
+          `reason: ${reason}`,
+        ],
+        scope: signature,
+        choices: [
+          { key: 'y', label: 'allow once', decision: 'allow_once' },
+          { key: 'a', label: 'always allow this command', decision: 'allow_always' },
+          { key: 'n', label: 'deny once', decision: 'deny_once' },
+          { key: 'd', label: 'always deny this command', decision: 'deny_always' },
+        ],
+      })
 
     if (promptResult.decision === 'allow_once') {
-      this.sessionAllowedCommands.add(signature)
+      // 真·一次性：不写入任何记忆层，下次同类命令仍会弹卡
       return
     }
 
     if (promptResult.decision === 'allow_always') {
       this.allowedCommandPatterns.add(signature)
-      await this.persist()
-      return
+        await this.persist()
+        return
+      }
+
+      if (promptResult.decision === 'deny_always') {
+        this.deniedCommandPatterns.add(signature)
+        await this.persist()
+      } else {
+        this.sessionDeniedCommands.add(signature)
+      }
+
+      throw new Error(`Command denied: ${signature}`)
     }
 
-    if (promptResult.decision === 'deny_always') {
-      this.deniedCommandPatterns.add(signature)
-      await this.persist()
-    } else {
-      this.sessionDeniedCommands.add(signature)
-    }
+    async ensureEdit(targetPath: string, diffPreview: string): Promise<void> {
+      await this.ready
 
-    throw new Error(`Command denied: ${signature}`)
-  }
+      const normalizedTarget = normalizePath(targetPath)
 
-  async ensureEdit(targetPath: string, diffPreview: string): Promise<void> {
-    await this.ready
+      if (
+        this.sessionDeniedEdits.has(normalizedTarget) ||
+        this.deniedEditPatterns.has(normalizedTarget)
+      ) {
+        throw new Error(`Edit denied: ${normalizedTarget}`)
+      }
 
-    const normalizedTarget = normalizePath(targetPath)
+      if (
+        this.turnAllowedEdits.has(normalizedTarget) ||
+        this.turnAllowAllEdits ||
+        this.allowedEditPatterns.has(normalizedTarget)
+      ) {
+        return
+      }
 
-    if (
-      this.sessionDeniedEdits.has(normalizedTarget) ||
-      this.deniedEditPatterns.has(normalizedTarget)
-    ) {
-      throw new Error(`Edit denied: ${normalizedTarget}`)
-    }
+      if (!this.prompt) {
+        throw new Error(
+          `Edit requires approval but no interactive approver is available: ${normalizedTarget}. Hard restriction: do NOT accomplish this file change through bash (redirection, Set-Content, Out-File, WriteAllText, etc.). Tell the user what was blocked.`,
+        )
+      }
 
-    if (
-      this.sessionAllowedEdits.has(normalizedTarget) ||
-      this.turnAllowedEdits.has(normalizedTarget) ||
-      this.turnAllowAllEdits ||
-      this.allowedEditPatterns.has(normalizedTarget)
-    ) {
-      return
-    }
-
-    if (!this.prompt) {
-      throw new Error(
-        `Edit requires approval but no interactive approver is available: ${normalizedTarget}. Hard restriction: do NOT accomplish this file change through bash (redirection, Set-Content, Out-File, WriteAllText, etc.). Tell the user what was blocked.`,
-      )
-    }
-
-    const promptResult = await this.prompt({
-      kind: 'edit',
-      summary: 'ICEFOX-code wants to apply a file modification',
-      details: [
-        `target: ${normalizedTarget}`,
-        '',
-        diffPreview,
-      ],
-      scope: normalizedTarget,
-      choices: [
-        { key: '1', label: 'apply once', decision: 'allow_once' },
-        { key: '2', label: 'allow this file in this turn', decision: 'allow_turn' },
-        { key: '3', label: 'allow all edits in this turn', decision: 'allow_all_turn' },
-        { key: '4', label: 'always allow this file', decision: 'allow_always' },
-        { key: '5', label: 'reject once', decision: 'deny_once' },
-        { key: '6', label: 'reject and send guidance to model', decision: 'deny_with_feedback' },
-        { key: '7', label: 'always reject this file', decision: 'deny_always' },
-      ],
-    })
+      const promptResult = await this.prompt({
+        kind: 'edit',
+        summary: 'ICEFOX-code wants to apply a file modification',
+        details: [
+          `target: ${normalizedTarget}`,
+          '',
+          diffPreview,
+        ],
+        scope: normalizedTarget,
+        choices: [
+          { key: '1', label: 'apply once', decision: 'allow_once' },
+          { key: '2', label: 'allow this file in this turn', decision: 'allow_turn' },
+          { key: '3', label: 'allow all edits in this turn', decision: 'allow_all_turn' },
+          { key: '4', label: 'always allow this file', decision: 'allow_always' },
+          { key: '5', label: 'reject once', decision: 'deny_once' },
+          { key: '6', label: 'reject and send guidance to model', decision: 'deny_with_feedback' },
+          { key: '7', label: 'always reject this file', decision: 'deny_always' },
+        ],
+      })
 
     if (promptResult.decision === 'allow_once') {
-      this.sessionAllowedEdits.add(normalizedTarget)
+      // 真·一次性：本次放行，不留任何记忆；下一回合 beginTurn 也不受影响
       return
     }
 
     if (promptResult.decision === 'allow_turn') {
-      this.turnAllowedEdits.add(normalizedTarget)
-      return
-    }
-
-    if (promptResult.decision === 'allow_all_turn') {
-      this.turnAllowAllEdits = true
-      return
-    }
-
-    if (promptResult.decision === 'allow_always') {
-      this.allowedEditPatterns.add(normalizedTarget)
-      await this.persist()
-      return
-    }
-
-    if (promptResult.decision === 'deny_with_feedback') {
-      const guidance = promptResult.feedback?.trim()
-      if (guidance) {
-        throw new Error(
-          `Edit denied: ${normalizedTarget}\nUser guidance: ${guidance}`,
-        )
+        this.turnAllowedEdits.add(normalizedTarget)
+        return
       }
-      this.sessionDeniedEdits.add(normalizedTarget)
+
+      if (promptResult.decision === 'allow_all_turn') {
+        this.turnAllowAllEdits = true
+        return
+      }
+
+      if (promptResult.decision === 'allow_always') {
+        this.allowedEditPatterns.add(normalizedTarget)
+        await this.persist()
+        return
+      }
+
+      if (promptResult.decision === 'deny_with_feedback') {
+        const guidance = promptResult.feedback?.trim()
+        if (guidance) {
+          throw new Error(
+            `Edit denied: ${normalizedTarget}\nUser guidance: ${guidance}`,
+          )
+        }
+        this.sessionDeniedEdits.add(normalizedTarget)
+        throw new Error(`Edit denied: ${normalizedTarget}`)
+      }
+
+      if (promptResult.decision === 'deny_always') {
+        this.deniedEditPatterns.add(normalizedTarget)
+        await this.persist()
+      } else {
+        this.sessionDeniedEdits.add(normalizedTarget)
+      }
+
       throw new Error(`Edit denied: ${normalizedTarget}`)
     }
-
-    if (promptResult.decision === 'deny_always') {
-      this.deniedEditPatterns.add(normalizedTarget)
-      await this.persist()
-    } else {
-      this.sessionDeniedEdits.add(normalizedTarget)
-    }
-
-    throw new Error(`Edit denied: ${normalizedTarget}`)
   }
-}
 
-export function getPermissionsPath(): string {
-  return PERMISSIONS_PATH
-}
+  export function getPermissionsPath(): string {
+    return PERMISSIONS_PATH
+  }

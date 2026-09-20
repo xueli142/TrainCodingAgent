@@ -36,7 +36,7 @@ function parseFrontmatter(text: string): {
     }
   }
 
-  return {
+  return {  
     name: fields.get('name'),
     description: fields.get('description'),
     body: text.slice(match[0].length + 1),
@@ -46,7 +46,7 @@ function parseFrontmatter(text: string): {
 function skillRoots(cwd: string): string[] {
   return [path.join(cwd, '.icefox', 'skills'), path.join(ICEFOX_CODE_DIR, 'skills')]
 }
-
+//这个返回的只是skill摘要（name/description/location），供 system prompt 目录使用；完整 body 由 SkillTool 按需加载
 export async function discoverSkills(cwd: string): Promise<SkillSummary[]> {
   const skills = new Map<string, SkillSummary>()
 
@@ -79,7 +79,8 @@ export async function discoverSkills(cwd: string): Promise<SkillSummary[]> {
 
   return [...skills.values()].sort((a, b) => a.name.localeCompare(b.name))
 }
-
+//把一批技能（skills）的摘要格式化成一段 XML 风格的文本，
+// 嵌进给模型的 prompt 里，告诉模型有哪些技能可用、各自是干什么的、以及去哪加载
 export function formatSkillsForPrompt(skills: SkillSummary[]): string | undefined {
   const described = skills.filter(skill => skill.description.length > 0)
   if (described.length === 0) {
@@ -143,6 +144,7 @@ export const SkillTool: ToolDefinition<SkillInput> = {
         `<skill_content name="${match.name}">`,
         `# Skill: ${match.name}`,
         '',
+        //body在这里使用上，是只有使用具体的某个skill的时候，才会把body加上去
         meta.body.trim(),
         '',
         `Base directory for this skill: ${baseDir}`,
