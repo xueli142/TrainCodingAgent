@@ -20,7 +20,7 @@ function isEmptyAssistantResponse(content: string): boolean {
 
 //TODO 未完善的tool执行工具
 async function executeTool(name: string, rawInput: unknown, context: ToolContent): Promise<ToolResult> {
-  console.log('=== Tool Call ===')
+ 
   console.log('Name:', name)
   console.log('Raw Input:', JSON.stringify(rawInput, null, 2))
 
@@ -66,7 +66,6 @@ export async function agentloop(args: {
   cwd: string
   permissions?: PermissionManager
   maxSteps?: number
-  
   toolResultState?: ContentReplacementState
   onAssistantMessage?: (content: string, metadata?: { final?: boolean }) => void
   onProgressMessage?: (content: string) => void

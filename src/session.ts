@@ -340,6 +340,7 @@ async function flushPending(): Promise<number> {
 /**
  * 标脏一个 session。注意存的是 messages 的**引用**而非快照：
  * flush 时读取的是那一刻的最新全量数组，配合 id 去重自然收敛到最后状态。
+ * 
  */
 export function scheduleSave(
   cwd: string,
@@ -353,9 +354,11 @@ export function scheduleSave(
     return
   }
   pendingJobs.set(key, { cwd, sessionId, messages, lastSavedLength: -1 })
+  //写盘代码
   if (!flushTimer) {
     flushTimer = setInterval(() => {
       // 定时器回调里吞掉错误：失败不应导致未捕获异常，下一轮会重试
+      // 调用落盘代码
       void flushPending().catch(() => {})
     }, SAVE_FLUSH_INTERVAL_MS)
     // unref：定时器不阻止进程退出

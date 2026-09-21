@@ -5,6 +5,7 @@ export async function buildSystemPrompt(
   skillBlock?: string,
 ): Promise<string> {
   const parts = [
+    'Your name is icefox ',
     'You are a helpful coding assistant with access to local file system tools.',
     ...(environmentLines.length > 0 ? [environmentLines.join('\n')] : []),
     `Current cwd: ${cwd}`,

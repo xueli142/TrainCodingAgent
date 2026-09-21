@@ -12,7 +12,7 @@ await permissions.whenReady()
 
 const userMessage = process.argv[2] ?? '你好，看看你的tool有什么'
 
-const messages: ChatMessage[] = [
+let messages: ChatMessage[] = [
   {
     role: 'system',
     content: await buildSystemPrompt(cwd, permissions.getSummary()),

@@ -29,6 +29,7 @@ import {
   saveMessages,
   scheduleSave,
   sessionFilePath,
+  appendControlEvent,
 } from './session.js'
 import { maybeCompactContext } from './compact.js'
 
@@ -139,7 +140,7 @@ async function main(): Promise<void> {
     restored = loaded
   }
 
-  const messages: ChatMessage[] = [
+  let messages: ChatMessage[] = [
     { role: 'system', content: await systemContent() },
     buildToolCatalogMessage(),
     ...restored,
@@ -214,8 +215,10 @@ async function main(): Promise<void> {
       console.log(`session ${target} empty after switch`)
       return
     }
-
-    messages.splice(0, messages.length, { role: 'system', content: await systemContent() }, buildToolCatalogMessage(), ...loaded)
+      //在原本的数组上修改
+    //messages.splice(0, messages.length, { role: 'system', content: await systemContent() }, buildToolCatalogMessage(), ...loaded)
+    //新建一个数组，
+    messages = [{ role: 'system', content: await systemContent() }, buildToolCatalogMessage(), ...loaded]
     sessionId = target
     await appendSessionEvent(cwd, sessionId, 'context_snapshot', {
       model: MODEL,
@@ -247,6 +250,20 @@ async function main(): Promise<void> {
       if (input === '/exit') {
         break
       }
+    
+      if (input === '/clear') {
+  await flushSessionSaves()                          // 旧会话的待写全部落盘（此刻还是旧引用、旧 sessionId）
+  await saveMessages(cwd, sessionId, messages)       // 双保险：全量写旧文件
+  const oldId = sessionId
+  sessionId = newSessionId()
+  messages = [
+    { role: 'system', content: await systemContent() },
+    buildToolCatalogMessage(),
+  ]
+  console.log(`已清空上下文，新会话 ${sessionId}；旧会话 ${oldId} 仍在盘上，/resume ${oldId} 可找回`)
+  continue
+}     
+      //列出所有sessions
       if (input === '/sessions') {
         const sessions = await listSessions(cwd)
         if (sessions.length === 0) {
@@ -259,11 +276,56 @@ async function main(): Promise<void> {
         })
         continue
       }
+      // 重命名对话
+      if (input === '/rename' || input.startsWith('/rename ')) {
+  const title = input.slice('/rename'.length).trim()
+  if (!title) {
+    console.log('用法: /rename <标题>')
+    continue
+  }
+  await appendControlEvent(cwd, sessionId, 'rename', { title })   // 控制事件即时落盘，不进批量窗口
+  console.log(`当前会话已命名：${title}`)
+  continue
+}           
+
       if (input === '/resume' || input.startsWith('/resume ')) {
         await handleResume(input.slice('/resume'.length).trim())
+        
+        continue
+
+      }
+      
+      //压缩上下文（TODO：给 maybeCompactContext 加 force 参数后手动触发；break 会退出整个 REPL，绝不能用）
+      if (input === '/compact') {
+        console.log('（占位）/compact 尚未实现')
         continue
       }
-
+      //删除会话（TODO：接 clearSession + 二次确认删除，对象应是「非当前会话」或先 /clear）
+      if (input === '/delete') {
+        console.log('（占位）/delete 尚未实现')
+        continue
+      }
+      //切换模型（TODO：写 model 字段 + 重建 system 提示）
+      if (input === '/model') {
+        console.log('（占位）/model 尚未实现')
+        continue
+      }
+      if (input === '/help') {
+        console.log([
+          '/exit              退出（Ctrl+C / Ctrl+D 亦可）',
+          '/clear             清空上下文并开新会话（旧会话保留在盘上）',
+          '/sessions          列出本项目历史会话（当前带 *）',
+          '/rename <标题>     重命名当前会话',
+          '/resume [id|序号]  切换会话',
+          '/compact /delete /model /init  占位，尚未实现',
+        ].join('\n'))
+        continue
+      }
+      //初始化项目指令（TODO：生成 AGENTS.md 风格说明文件，见 TODO.md B1）
+      if (input === '/init') {
+        console.log('（占位）/init 尚未实现')
+        continue
+      }
       messages.push({ role: 'user', content: input })
       scheduleSave(cwd, sessionId, messages)
 
