@@ -3,7 +3,8 @@ import { ToolContent, ToolResult } from './tool.js'
 import { ChatMessage, ModelAdapter, ProviderThinkingBlock, ProviderUsage } from './type.js'
 import { PermissionManager } from './permissionManager.js'
 import { replaceLargeToolResult, applyToolResultBudget, PendingToolResult, ContentReplacementState } from './utils/tool-result.js'
-
+//根据模型选择内容判断当前回答的状态
+//TODO aborted — 用户取消 failed — 失败 retry — 重试
 export type TurnDiagInfo = {
   step: number
   kind: 'final' | 'empty' | 'tools' | 'max_steps'
@@ -12,13 +13,12 @@ export type TurnDiagInfo = {
   stopReason?: string
 }
 
-const LOOP_GUARD_AFTER_REPEATS = 3
+const LOOP_GUARD_AFTER_REPEATS = 5
 
 function isEmptyAssistantResponse(content: string): boolean {
   return content.trim().length === 0
 }
 
-//TODO 未完善的tool执行工具
 async function executeTool(name: string, rawInput: unknown, context: ToolContent): Promise<ToolResult> {
  
   console.log('Name:', name)
@@ -88,7 +88,7 @@ export async function agentloop(args: {
       added.push(item)
     }
   }
-
+//添加思考块
   const appendThinkingBlocks = (blocks: ProviderThinkingBlock[] | undefined): void => {
     if (!blocks || blocks.length === 0) return
     append({ role: 'assistant_thinking', blocks })
@@ -97,7 +97,7 @@ export async function agentloop(args: {
       if (text.trim()) args.onThinking?.(text)
     }
   }
-
+//最大步数计数
   for (let step = 0; maxSteps > step; step++) {
     const response = await args.model.next(messages)
 
@@ -106,7 +106,7 @@ export async function agentloop(args: {
       const isProgress = response.kind === 'progress'
 
       appendThinkingBlocks(response.thinkingBlocks)
-//progress 中间态：只作提示展示，不视为回合的最终回复
+      //progress 中间态：只作提示展示，不视为回合的最终回复
       if (!isEmpty && isProgress) {
         args.onProgressMessage?.(response.content)
         append({ role: 'assistant_progress', content: response.content })
@@ -124,6 +124,7 @@ export async function agentloop(args: {
       if (!isEmpty) {
         append(assistantMessage)
       }
+      //最终输出
       args.onTurnDiags?.({
         step,
         kind: 'final',
@@ -149,7 +150,7 @@ export async function agentloop(args: {
       args.onTurnDiags?.({ step, kind: 'empty', usage: response.usage })
       return added
     }
-
+    //思考块和工具shu
     appendThinkingBlocks(response.thinkingBlocks)
     append(...response.calls.map(call => ({
       role: 'assistant_tool_call' as const,
@@ -173,7 +174,7 @@ export async function agentloop(args: {
       if (count === LOOP_GUARD_AFTER_REPEATS) {
         output = `${output}\n\n[loop-guard] 这是第 ${count} 次完全相同的 ${call.toolName} 调用。重复执行不会改变结果——换方法（不同工具/不同参数/读取已有结果文件），或直接基于此前结果给出回答。`
       }
-
+          //替换成chatmessage的输出格式
       toolResults.push(await replaceLargeToolResult({
         role: 'tool_result',
         toolUseId: call.id,
@@ -195,7 +196,7 @@ export async function agentloop(args: {
       ...(response.diagnostics?.stopReason ? { stopReason: response.diagnostics.stopReason } : {}),
     })
   }
-
+  //最大次数限制
   args.onTurnDiags?.({ step: maxSteps, kind: 'max_steps' })
   const maxStepsNotice = `达到最大工具步数限制（${maxSteps}），已停止当前回合。`
   args.onAssistantMessage?.(maxStepsNotice, { final: true })
