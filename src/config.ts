@@ -17,3 +17,28 @@ export const ICEFOX_CODE_DIR = process.env.ICEFOX_CODE_HOME
   ? path.resolve(process.env.ICEFOX_CODE_HOME)
   : path.join(os.homedir(), '.ICEFOX-code')
 
+export type McpServerConfig = {
+  command?: string
+  args?: string[]
+  env?: Record<string, string>
+  url?: string
+  headers?: Record<string, string>
+}
+
+export const mcpConfig: Record<string, McpServerConfig> = {
+  fs: {
+    command: 'npx',
+    args: ['-y', '@modelcontextprotocol/server-filesystem', process.cwd()],
+  },
+
+  cook:{
+    command:'npx',
+    args:['-y','howtocook-mcp']
+
+  },
+  remote_demo: {
+    url: 'http://localhost:3000/mcp',
+    headers: { Authorization: 'Bearer ${MY_TOKEN}' },  // 可选，$ENV 插值
+  },
+}
+

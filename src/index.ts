@@ -8,7 +8,7 @@ import { agentloop } from './agent_loop.js'
 import { AnthropicModelAdapter } from './anthropic-adapter.js'
 import type { ChatMessage } from './type.js'
 import { enableTrace, flushTrace } from './context-tracer.js'
-import{MODEL}from './config.js'
+import{MODEL, mcpConfig}from './config.js'
 import { createContentReplacementState } from './utils/tool-result.js'
 import { discoverSkills, formatSkillsForPrompt } from './tools/tool/index.js'
 
@@ -38,6 +38,7 @@ setDefaultResultOrder('ipv4first')
 initRegistry()
 import { setQuestionHandler } from './tools/tool/index.js'
 import { readLine,attachInputSource } from './tty-prompt.js'
+import { connectMcpServers, disposeMcp } from './mcp.js'
 
 setQuestionHandler(async (questions) => {
   const answers: string[] = []
@@ -63,6 +64,7 @@ setQuestionHandler(async (questions) => {
   }
   return answers
 })
+
 const argv = process.argv.slice(2)
 const procEnv = buildProcessEnvironment()
 const projectEnv = buildProjectEnvironment(process.cwd(), procEnv)
@@ -108,6 +110,9 @@ async function main(): Promise<void> {
   const permissions = new PermissionManager(cwd, createPermissionPromptHandler())
   //等待磁盘权限加载完
   await permissions.whenReady()
+
+  //MCP 工具必须在 model 构造（快照 getToolSchemas）之前注册进 registry
+  await connectMcpServers(mcpConfig)
 
   const model = new AnthropicModelAdapter(getToolSchemas())
 
@@ -175,6 +180,7 @@ async function main(): Promise<void> {
   const flushOnExit = async () => {
     await flushTrace()
     await flushSessionSaves()
+    await disposeMcp()
   }
   process.on('SIGINT', () => {
     void flushOnExit().finally(() => process.exit(130))
@@ -351,8 +357,14 @@ async function main(): Promise<void> {
           permissions,
           maxSteps: 30,
           toolResultState,
+          
           onAssistantMessage: content => { console.log(`\n${content}\n`) },
           onProgressMessage: content => { console.log(`[progress] ${content}`) },
+          onThinking: content => {
+            const preview = content.length > 400 ? `${content.slice(0, 400)}…` : content
+            const dim = preview.replace(/\n/g, '\n\u001b[2m')
+            console.log(`\u001b[2m[thinking] ${dim}\u001b[0m`)
+          },
           onTurnDiags: info => {
             void appendSessionEvent(cwd, sessionId, 'turn_end', { ...info }).catch(() => {})
           },
@@ -379,3 +391,4 @@ main().catch(error => {
   console.error(error)
   process.exitCode = 1
 })
+

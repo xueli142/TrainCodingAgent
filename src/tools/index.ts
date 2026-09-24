@@ -30,6 +30,12 @@ export function registerTool<T>(tool: ToolDefinition<T>): void {
   registry.set(tool.name, tool)
 }
 
+export function unregisterToolsByPrefix(prefix: string): void {
+  for (const name of registry.keys()) {
+    if (name.startsWith(prefix)) registry.delete(name)
+  }
+}
+
 export function getTool(name: string): ToolDefinition<any> | undefined {
   return registry.get(name)
 }

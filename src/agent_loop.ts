@@ -66,10 +66,12 @@ export async function agentloop(args: {
   cwd: string
   permissions?: PermissionManager
   maxSteps?: number
+//  mcpTools?:
   toolResultState?: ContentReplacementState
   onAssistantMessage?: (content: string, metadata?: { final?: boolean }) => void
   onProgressMessage?: (content: string) => void
-  onTurnDiags?: (info: TurnDiagInfo) => void  
+  onThinking?: (content: string) => void
+  onTurnDiags?: (info: TurnDiagInfo) => void
 }): Promise<ChatMessage[]> {
   const messages = args.messages
   const maxSteps = args.maxSteps ?? 30
@@ -90,6 +92,10 @@ export async function agentloop(args: {
   const appendThinkingBlocks = (blocks: ProviderThinkingBlock[] | undefined): void => {
     if (!blocks || blocks.length === 0) return
     append({ role: 'assistant_thinking', blocks })
+    for (const block of blocks) {
+      const text = typeof block.thinking === 'string' ? block.thinking : ''
+      if (text.trim()) args.onThinking?.(text)
+    }
   }
 
   for (let step = 0; maxSteps > step; step++) {
