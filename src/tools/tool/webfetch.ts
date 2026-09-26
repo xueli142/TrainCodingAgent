@@ -3,7 +3,6 @@ import type { ToolDefinition } from '../../tool.js'
 import { jsonSchemaOf } from './schema-io.js'
 
 const DEFAULT_TIMEOUT_SECONDS = 60
-const MAX_CONTENT_CHARS = 100_000
 
 const schema = z.object({
   url: z.string().describe('The URL to fetch content from'),
@@ -60,7 +59,7 @@ export const WebFetchTool: ToolDefinition<WebFetchInput> = {
   ].join('\n'),
   inputSchema: jsonSchemaOf(schema),
   schema,
-  async run(input) {
+  async run(input, context) {
     if (!/^https?:\/\//i.test(input.url)) {
       return {
         ok: false,
@@ -74,7 +73,9 @@ export const WebFetchTool: ToolDefinition<WebFetchInput> = {
     let response: Response
     try {
       response = await fetch(url, {
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: context.signal
+          ? AbortSignal.any([AbortSignal.timeout(timeoutMs), context.signal])
+          : AbortSignal.timeout(timeoutMs),
         redirect: 'follow',
         headers: {
           'user-agent': 'icefox-agent/1.0',
@@ -115,23 +116,18 @@ export const WebFetchTool: ToolDefinition<WebFetchInput> = {
     const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(body)
     const title = titleMatch?.[1]?.replace(/<[^>]+>/g, '').trim()
 
-    const truncated = output.length > MAX_CONTENT_CHARS
-    const clipped = truncated ? output.slice(0, MAX_CONTENT_CHARS) : output
-
     const header = [
       `URL: ${url}`,
       title ? `Title: ${title}` : undefined,
       `ContentType: ${contentType || 'unknown'}`,
-      truncated
-        ? `...content truncated at ${MAX_CONTENT_CHARS} chars (total ${output.length} chars)`
-        : undefined,
+      `Length: ${output.length} chars`,
     ]
       .filter(Boolean)
       .join('\n')
 
     return {
       ok: true,
-      output: `${header}\n\n${clipped}`,
+      output: `${header}\n\n${output}`,
     }
   },
 }

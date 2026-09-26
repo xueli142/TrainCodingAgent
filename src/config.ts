@@ -23,9 +23,11 @@ export type McpServerConfig = {
   env?: Record<string, string>
   url?: string
   headers?: Record<string, string>
+  enabled?: boolean
 }
 
-export const mcpConfig: Record<string, McpServerConfig> = {
+//兜底默认（BUILT_IN）；正式配置放 ~/.ICEFOX-code/mcp.json 与 <cwd>/.icefox/mcp.json
+const DEFAULT_MCP_SERVERS: Record<string, McpServerConfig> = {
   fs: {
     command: 'npx',
     args: ['-y', '@modelcontextprotocol/server-filesystem', process.cwd()],
@@ -39,6 +41,39 @@ export const mcpConfig: Record<string, McpServerConfig> = {
   remote_demo: {
     url: 'http://localhost:3000/mcp',
     headers: { Authorization: 'Bearer ${MY_TOKEN}' },  // 可选，$ENV 插值
+    enabled: false,
   },
+}
+
+function shapeCheck(raw: unknown): Record<string, McpServerConfig> {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const out: Record<string, McpServerConfig> = {}
+  for (const [name, entry] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof entry === 'object' && entry !== null) {
+      out[name] = entry as McpServerConfig
+    }
+  }
+  return out
+}
+
+/** 两级合并：用户级 mcp.json → 项目级 .icefox/mcp.json 覆盖同名；都没有则用内置默认 */
+export async function loadMcpConfig(cwd: string): Promise<Record<string, McpServerConfig>> {
+  const { readFile } = await import('node:fs/promises')
+  let merged: Record<string, McpServerConfig> = { ...DEFAULT_MCP_SERVERS }
+  for (const file of [
+    path.join(ICEFOX_CODE_DIR, 'mcp.json'),
+    path.join(cwd, '.icefox', 'mcp.json'),
+  ]) {
+    try {
+      const parsed = JSON.parse(await readFile(file, 'utf8')) as { mcpServers?: unknown }
+      merged = { ...merged, ...shapeCheck(parsed.mcpServers ?? parsed) }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code
+      if (code !== 'ENOENT') {
+        console.warn(`[mcp] 配置解析失败 ${file}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+  }
+  return merged
 }
 

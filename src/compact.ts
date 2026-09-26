@@ -1,19 +1,21 @@
 import type { ChatMessage, ModelAdapter } from './type.js'
+import { computeContextStats, estimateMessagesTokens, markUsagesStale } from './utils/token-estimator.js'
+import { MODEL } from './config.js'
 
 /**
- * 简易上下文压缩（对齐 MiniCode 分层的最低一档 autocompact）：
- *  - 估算：Σ chars / 3.5
- *  - 触发：占上下文窗口 ≥ 85%
- *  - 动作：固定头部（system/tool）+ 尾部 KEEP_RECENT 保留，中间段渲染成 transcript 让小上下文 summarize
- *  - 产出：context_summary 消息（作为事件持久化；projectMessages 从最后一条 summary 截断起播）
- *  - 失败即放弃本轮压缩，绝不丢消息（盘上事实永远全量，投影截断只发生在 summary 已生成之后）
+ * 上下文压缩两层（B1 后）：
+ *  - microcompact：利用率过半时，旧 tool_result 内容就地清成 [cleared] 占位（便宜、无损事实——盘上仍是全量）
+ *  - autocompact：≥85% effectiveInput 时，中段 summarize 成 context_summary；压缩后旧 usage 锚点整批标脏
+ * 触发计数用 token-estimator 的"锚点+增量"，不再依赖纯字符估算。
  */
 
 export const COMPACT_CONFIG = {
-  contextWindowTokens:256_000,
   triggerUtilization: 0.85,
+  microcompactUtilization: 0.5,
   keepRecentMessages: 10,
   minMiddleMessages: 6,
+  microkeepRecent: 8,
+  microMinChars: 200,
 }
 
 const COMPRESSOR_SYSTEM = [
@@ -44,19 +46,26 @@ function messageText(message: ChatMessage): string {
   }
 }
 
-function messageChars(message: ChatMessage): number {
-  if (message.role === 'assistant_thinking') {
-    return JSON.stringify(message.blocks).length
-  }
-  return messageText(message).length
+export function estimateTokens(messages: ChatMessage[]): number {
+  return estimateMessagesTokens(messages)
 }
 
-export function estimateTokens(messages: ChatMessage[]): number {
-  let chars = 0
-  for (const message of messages) {
-    chars += messageChars(message) + 8
+/** 便宜层：只清旧的大块 tool_result 内容，消息骨架与盘上事实不动 */
+export function microcompactToolResults(
+  messages: ChatMessage[],
+  keepRecent = COMPACT_CONFIG.microkeepRecent,
+  minChars = COMPACT_CONFIG.microMinChars,
+): number {
+  let cleared = 0
+  const keepFrom = Math.max(0, messages.length - keepRecent)
+  for (let i = 0; i < keepFrom; i++) {
+    const message = messages[i]
+    if (message.role === 'tool_result' && !message.isError && message.content.length > minChars) {
+      message.content = '[cleared]'
+      cleared += 1
+    }
   }
-  return Math.ceil(chars / 3.5)
+  return cleared
 }
 
 function renderTranscript(messages: ChatMessage[]): string {
@@ -90,22 +99,32 @@ export type CompactOutcome = {
 export async function maybeCompactContext(input: {
   model: ModelAdapter
   messages: ChatMessage[]
+  force?: boolean
   config?: Partial<typeof COMPACT_CONFIG>
 }): Promise<CompactOutcome> {
   const config = { ...COMPACT_CONFIG, ...input.config }
   const messages = input.messages
-  const before = estimateTokens(messages)
-  const threshold = config.contextWindowTokens * config.triggerUtilization
 
+  //便宜层先行：过半就清旧大块 tool_result（只改内存投影，盘上全量事实不动）
+  let cleared = 0
+  let stats = computeContextStats(messages, MODEL)
+  if (stats.utilization >= config.microcompactUtilization) {
+    cleared = microcompactToolResults(messages)
+    if (cleared > 0) {
+      stats = computeContextStats(messages, MODEL)
+    }
+  }
+
+  const before = stats.totalTokens
   const untouched: CompactOutcome = {
     compacted: false,
     messages,
-    removedCount: 0,
+    removedCount: cleared,
     tokensBefore: before,
     tokensAfter: before,
   }
 
-  if (before < threshold) {
+  if (!input.force && stats.utilization < config.triggerUtilization) {
     return untouched
   }
 
@@ -142,15 +161,15 @@ export async function maybeCompactContext(input: {
       compressedCount: middle.length,
       timestamp: Date.now(),
     }
-    const nextMessages = [
+    const nextMessages = markUsagesStale([
       ...messages.slice(0, headEnd),
       summary,
       ...messages.slice(tailStart),
-    ]
+    ])
     return {
       compacted: true,
       messages: nextMessages,
-      removedCount: middle.length,
+      removedCount: middle.length + cleared,
       tokensBefore: before,
       tokensAfter: estimateTokens(nextMessages),
     }

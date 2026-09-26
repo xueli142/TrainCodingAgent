@@ -16,16 +16,16 @@
 - [X] `executeTool` 调试 `console.log` 噪音移除
 - [X] extended thinking：请求带 `budget_tokens`（`THINKING_BUDGET=0` 关闭）+ 灰色 `[thinking]` 预览打印
 
-## B0 · 还债（~0.5-1 天，先做这个）
+## B0 · 还债（已完成 2026-09-26，`pnpm check` + `pnpm test` 全绿）
 
-- [ ] ⭐ `agentloop` 返回值改**收据**而非消息数组：`Promise<TurnReceipt>`（`addedCount / stopReason / usage`），调用方要内容就 `messages.slice(before)`——让"caller 不得回推"从 README 约定变成编译期不可能（类型仍是 `ChatMessage[]` 就是给未来调用方留弹药）
-- [ ] `saveMessagesLocked` 批次内不去重：同一次调用数组里重复的同 id 消息会双双落盘（去重集合来自盘上快照，批内不回填）→ filter 时同步 add
-- [ ] 弹卡抢答边界：回合中提前输入会排队，被下一张审批卡吃掉 → 弹卡时提示"回车跳过已排队输入"或清空 stale queue
-- [ ] trust 闭环：`trustProject` 接线加 `/trust` 命令，或者把 trust 从 system prompt 里摘掉——不要留装饰
-- [ ] `getPermissionsPath`：接进 `/sessions` 输出展示，或删
-- [ ] `resumeMessages` 的 `chunkId` 切片：要么实现（会话回放/分支用），要么删参数
-- [ ] 工程卫生：`.gitattributes`（`* text=auto eol=lf`）；`package.json` name 改 `icefox-agent`、修/删坏掉的 `check-deps` 脚本；加 `check` 脚本（devDep typescript + `tsc --noEmit`，这几轮全靠借 MiniCode 的 tsc）；清理 `tools/` 顶层 5 个未注册遗留文件 + 空文件 `register.ts`/`checkroute.ts`/`search_file.ts`/`text/`
-- [ ] **冒烟测试起步**（node:test，对齐 MiniCode）：agentloop 增量合约 / loop-guard / 批量预算替换稳定性 3 个用例
+- [X] ⭐ `agentloop` 返回值改**收据**：`Promise<TurnReceipt>`（`addedCount / kind / stopReason? / usage?`），消息只就地 push，caller 回推在类型层已不可能；新增 `test/agent-loop.test.ts` 锁合约
+- [X] `saveMessagesLocked` 批内去重：过滤循环同步回填 `batchSeen`，同数组重复 id 不再双双落盘
+- [X] 弹卡抢答：`tty-prompt.discardQueuedInput()`，审批卡与 question 弹前洗掉排队行并提示丢弃数
+- [X] trust 闭环 → 选**摘装饰**：删 `trustProject`/`readTrustList`/`ProjectEnvironment.trusted`/环境块 trusted 行/`context_snapshot.trusted` 字段，启动日志改显 `(git)`。若将来做真 trust，需要连 PermissionManager 的持久化策略一起设计
+- [X] `getPermissionsPath`：接进 `/sessions` 尾行展示
+- [X] `resumeMessages` 的 `chunkId`：选**实现**——投影改用 `sliced`（chunk 首事件之前的段），回滚/中间点重放从此可用（无调用方，纯补能力）
+- [X] 工程卫生：`.gitattributes`（`* text=auto eol=lf`）；package.json 更名 `icefox-agent`、删坏的 `check-deps`、新增 `check`（devDep typescript 5.9，**首次全项目类型检查通过**）与 `test` 脚本；清理 5 个未注册遗留工具文件 + `test-tool.ts` + 空文件 `register.ts`/`checkroute.ts`/`search_file.ts`
+- [X] **冒烟测试起步**（node:test + tsx loader，ICEFOX_CODE_HOME 隔离到临时目录）：agentloop 增量合约 / loop-guard 只注入一次 / 双层预算字节级复放，3 用例全过
 
 ## B1 · 体验补齐（~1-2 天）
 
@@ -74,6 +74,13 @@
 - [ ] L2（暂缓，另立项再评估）：自绘全屏 raw mode + 行级 diff 重绘，教材 MiniCode `tty-app.ts`/`screen.ts:53-85`；真要做先守输入事件 promise 链串行化（键击只写 input 缓冲、agent 回调只写 transcript，天然无锁）
 - [ ] ❌ 不上 Ink/OpenTUI：React 依赖与"极简可通读"冲突
 - [ ] 纪律（现在就守）：**UI 只订阅 `onAssistantMessage`/`onProgressMessage`/`onTurnDiags` 事件流，不读 agentloop 内部状态**——事件流即投影源，L2 时只搬 REPL，主循环不动
+
+## B4 · runtime状态追加，goal和plan
+
+
+
+
+
 
 ## 架构备忘（别回退）
 

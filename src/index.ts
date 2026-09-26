@@ -1,15 +1,17 @@
 import { setDefaultResultOrder } from 'node:dns'
 import readline from 'node:readline'
+import path from 'node:path'
+import { appendFile, readFile } from 'node:fs/promises'
 import { buildToolCatalogMessage, getToolSchemas, initRegistry } from './tools/index.js'
 import { buildSystemPrompt } from './prompt.js'
-import { PermissionManager } from './permissionManager.js'
+import { PermissionManager, getPermissionsPath } from './permissionManager.js'
 import { createPermissionPromptHandler } from './permissionUi.js'
 import { agentloop } from './agent_loop.js'
 import { AnthropicModelAdapter } from './anthropic-adapter.js'
 import type { ChatMessage } from './type.js'
 import { enableTrace, flushTrace } from './context-tracer.js'
-import{MODEL, mcpConfig}from './config.js'
-import { createContentReplacementState } from './utils/tool-result.js'
+import{MODEL, loadMcpConfig, ICEFOX_CODE_DIR}from './config.js'
+import { createContentReplacementState, pruneToolResults } from './utils/tool-result.js'
 import { discoverSkills, formatSkillsForPrompt } from './tools/tool/index.js'
 
 import {
@@ -21,7 +23,6 @@ import {
   appendSessionEvent,
   flushSessionSaves,
   listSessions,
-  latestSessionId,
   newSessionId,
   projectMessages,
   readEvents,
@@ -37,12 +38,16 @@ setDefaultResultOrder('ipv4first')
 
 initRegistry()
 import { setQuestionHandler } from './tools/tool/index.js'
-import { readLine,attachInputSource } from './tty-prompt.js'
-import { connectMcpServers, disposeMcp } from './mcp.js'
+import { readLine,attachInputSource, discardQueuedInput, interruptWaiters } from './tty-prompt.js'
+import { connectMcpServers, disposeMcp, getMcpStatus } from './mcp.js'
 
 setQuestionHandler(async (questions) => {
   const answers: string[] = []
   for (const q of questions) {
+    const dropped = discardQueuedInput()
+    if (dropped > 0) {
+      console.log(`[question] 已丢弃排队的 ${dropped} 行输入（防止抢答），需要请重新输入`)
+    }
     console.log(`\n? [${q.header}] ${q.question}`)
     q.options.forEach((o, i) =>
       console.log(`  ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`))
@@ -77,8 +82,7 @@ function flagValue(flag: string): string | undefined | null {
   return next && !next.startsWith('--') ? next : ''
 }
 
-function previewMessages(messages: ChatMessage[], count = 4): string[] {
-  return messages
+function previewMessages(messages: ChatMessage[], count = 4): string[] {  return messages
     .filter(m => m.role !== 'system' && m.role !== 'tool')
     .slice(-count)
     .map(m => {
@@ -89,6 +93,22 @@ function previewMessages(messages: ChatMessage[], count = 4): string[] {
       if (m.role === 'assistant_tool_call') return `call ${m.toolName}`
       return m.role
     })
+}
+
+/** 会话目标解析：序号 | 完整 id | 唯一前缀 */
+function resolveSessionId(
+  sessions: Array<{ id: string }>,
+  arg: string,
+): string | undefined {
+  if (/^\d+$/.test(arg)) {
+    return sessions[Number(arg) - 1]?.id
+  }
+  const exact = sessions.find(s => s.id === arg)
+  if (exact) {
+    return exact.id
+  }
+  const prefixHits = sessions.filter(s => s.id.startsWith(arg))
+  return prefixHits.length === 1 ? prefixHits[0]?.id : undefined
 }
 
 async function main(): Promise<void> {
@@ -112,7 +132,7 @@ async function main(): Promise<void> {
   await permissions.whenReady()
 
   //MCP 工具必须在 model 构造（快照 getToolSchemas）之前注册进 registry
-  await connectMcpServers(mcpConfig)
+  await connectMcpServers(await loadMcpConfig(cwd))
 
   const model = new AnthropicModelAdapter(getToolSchemas())
 
@@ -125,11 +145,64 @@ async function main(): Promise<void> {
     )
   }
 
+  // ── reader 先行：resume 交互与后续 REPL 共用单读者通道 ──
+  const historyFile = path.join(ICEFOX_CODE_DIR, 'history.jsonl')
+  const inputHistory: string[] = (await readFile(historyFile, 'utf8').catch(() => ''))
+    .split('\n')
+    .map(line => {
+      try {
+        return String((JSON.parse(line) as { input?: unknown }).input ?? '')
+      } catch {
+        return ''
+      }
+    })
+    .filter(Boolean)
+    .slice(0, 200)
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    history: inputHistory,
+    historySize: 200,
+  })
+  attachInputSource(rl)
+
+  const flushOnExit = async () => {
+    await flushTrace()
+    await flushSessionSaves()
+    await disposeMcp()
+  }
+
+  void pruneToolResults().catch(() => {})
+
+  // ── Ctrl+C 语义：回合中=取消当前回合（打审批卡/杀掉 signal 感知工具）；空闲/再按一次=退出 ──
+  let activeTurn: AbortController | null = null
+  const onCtrlC = () => {
+    if (activeTurn && !activeTurn.signal.aborted) {
+      activeTurn.abort()
+      const woken = interruptWaiters()
+      console.log(`\n[interrupt] 已取消当前回合${woken > 0 ? `（${woken} 张待答卡按拒绝处理）` : ''}`)
+      return
+    }
+    void flushOnExit().finally(() => process.exit(130))
+  }
+  rl.on('SIGINT', onCtrlC)
+  process.on('SIGINT', onCtrlC)
+
   let sessionId = newSessionId()
   let restored: ChatMessage[] = []
   const resumeArg = flagValue('--resume')
   if (resumeArg !== undefined) {
-    const target = resumeArg || (await latestSessionId(cwd))
+    const sessions = await listSessions(cwd)
+    let target: string | undefined
+    if (resumeArg) {
+      target = resolveSessionId(sessions, resumeArg)
+    } else if (sessions.length > 0) {
+      console.log('\nsessions:')
+      sessions.forEach((s, i) => console.log(`  ${i + 1}. ${s.id}  ${new Date(s.updatedAt).toLocaleString()}  ${s.title ?? ''}`))
+      const pick = (await readLine('输入序号或 id 前缀（回车取最新）: '))?.trim()
+      target = !pick ? sessions[0]?.id : resolveSessionId(sessions, pick)
+    }
     if (!target) {
       console.error('No saved session to resume.')
       process.exitCode = 1
@@ -152,7 +225,7 @@ async function main(): Promise<void> {
   ]
 
   console.log(`[session ${sessionId}] ${restored.length > 0 ? `resumed ${restored.length} messages` : 'new'}`)
-  console.log(`project: ${projectEnv.root} (${projectEnv.trusted ? 'trusted' : 'untrusted'})`)
+  console.log(`project: ${projectEnv.root}${projectEnv.isGitRepo ? ' (git)' : ''}`)
   console.log(`store: ${sessionFilePath(cwd, sessionId)}`)
 
   if (process.env.ICEFOX_TRACE !== '0') {
@@ -163,28 +236,12 @@ async function main(): Promise<void> {
   await appendSessionEvent(cwd, sessionId, 'context_snapshot', {
     model: MODEL,
     project: projectEnv.root,
-    trusted: projectEnv.trusted,
     system: messages[0]?.role === 'system' ? messages[0].content : '',
     catalog: messages[1]?.role === 'tool' ? messages[1].content : '',
     tools: getToolSchemas(),
   })
 
   await saveMessages(cwd, sessionId, messages)
-
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  })
-  attachInputSource(rl)
-
-  const flushOnExit = async () => {
-    await flushTrace()
-    await flushSessionSaves()
-    await disposeMcp()
-  }
-  process.on('SIGINT', () => {
-    void flushOnExit().finally(() => process.exit(130))
-  })
 
   async function handleResume(arg: string): Promise<void> {
     const sessions = await listSessions(cwd)
@@ -195,9 +252,9 @@ async function main(): Promise<void> {
       console.log('用法: /resume <id|序号>')
       return
     }
-    target = /^\d+$/.test(arg) ? sessions[Number(arg) - 1]?.id : arg
+    target = resolveSessionId(sessions, arg)
     if (!target) {
-      console.log(`session not found: ${arg}`)
+      console.log(`session not found: ${arg}（支持序号/完整id/唯一前缀）`)
       return
     }
     if (target === sessionId) {
@@ -229,8 +286,7 @@ async function main(): Promise<void> {
     await appendSessionEvent(cwd, sessionId, 'context_snapshot', {
       model: MODEL,
       project: projectEnv.root,
-      trusted: projectEnv.trusted,
-      system: messages[0]?.role === 'system' ? messages[0].content : '',
+        system: messages[0]?.role === 'system' ? messages[0].content : '',
       catalog: messages[1]?.role === 'tool' ? messages[1].content : '',
       tools: getToolSchemas(),
     })
@@ -280,6 +336,21 @@ async function main(): Promise<void> {
           const mark = s.id === sessionId ? '*' : ' '
           console.log(`${mark}${i + 1}. ${s.id}  ${new Date(s.updatedAt).toLocaleString()}  ${s.eventCount}e  ${s.title ?? ''}`)
         })
+        console.log(`permissions: ${getPermissionsPath()}`)
+        continue
+      }
+      //MCP 服务器状态（连接态 / 工具数 / 错误）
+      if (input === '/mcp') {
+        const statuses = getMcpStatus()
+        if (statuses.length === 0) {
+          console.log('未配置任何 MCP 服务器（~/.ICEFOX-code/mcp.json 或 .icefox/mcp.json）')
+          continue
+        }
+        for (const s of statuses) {
+          const mark = s.status === 'connected' ? '\u001b[32m●\u001b[0m' : s.status === 'disabled' ? '\u001b[90m○\u001b[0m' : '\u001b[31m✗\u001b[0m'
+          console.log(`${mark} ${s.name}  ${s.status}${s.status === 'connected' ? ` (${s.toolCount} tools)` : ''}${s.error ? `  ${s.error}` : ''}`)
+        }
+        console.log('改配置后重启生效；运行时 connect/disconnect 在 TODO')
         continue
       }
       // 重命名对话
@@ -301,9 +372,24 @@ async function main(): Promise<void> {
 
       }
       
-      //压缩上下文（TODO：给 maybeCompactContext 加 force 参数后手动触发；break 会退出整个 REPL，绝不能用）
+      //手动压缩：先走 micro（清旧 tool_result），过半不够再强制中段 summary
       if (input === '/compact') {
-        console.log('（占位）/compact 尚未实现')
+        const outcome = await maybeCompactContext({ model, messages, force: true })
+        if (outcome.compacted) {
+          messages.splice(0, messages.length, ...outcome.messages)
+          await saveMessages(cwd, sessionId, messages)
+          await appendSessionEvent(cwd, sessionId, 'turn_end', {
+            kind: 'compact',
+            removedCount: outcome.removedCount,
+            tokensBefore: outcome.tokensBefore,
+            tokensAfter: outcome.tokensAfter,
+          })
+          console.log(`/compact: ${outcome.removedCount} 条 → summary（${outcome.tokensBefore} → ${outcome.tokensAfter} tok）`)
+        } else if (outcome.removedCount > 0) {
+          console.log(`/compact(micro): 清理 ${outcome.removedCount} 条旧 tool_result 为 [cleared]`)
+        } else {
+          console.log('/compact: 无可压缩内容（中段太短或已经够小）')
+        }
         continue
       }
       //删除会话（TODO：接 clearSession + 二次确认删除，对象应是「非当前会话」或先 /clear）
@@ -318,12 +404,14 @@ async function main(): Promise<void> {
       }
       if (input === '/help') {
         console.log([
-          '/exit              退出（Ctrl+C / Ctrl+D 亦可）',
+          '/exit              退出（空闲时 Ctrl+C / Ctrl+D 亦可；回合中 Ctrl+C 只取消回合）',
           '/clear             清空上下文并开新会话（旧会话保留在盘上）',
           '/sessions          列出本项目历史会话（当前带 *）',
           '/rename <标题>     重命名当前会话',
-          '/resume [id|序号]  切换会话',
-          '/compact /delete /model /init  占位，尚未实现',
+          '/resume [id|序号]  切换会话（支持 id 前缀模糊）',
+          '/compact           手动压缩上下文（micro 优先，必要时 summary）',
+          '/delete /model /init  占位，尚未实现',
+          'Ctrl+C             回合中=取消当前回合；空闲=退出',
         ].join('\n'))
         continue
       }
@@ -334,6 +422,7 @@ async function main(): Promise<void> {
       }
       messages.push({ role: 'user', content: input })
       scheduleSave(cwd, sessionId, messages)
+      void appendFile(historyFile, JSON.stringify({ input }) + '\n').catch(() => {})
 
       const outcome = await maybeCompactContext({ model, messages })
       if (outcome.compacted) {
@@ -345,18 +434,22 @@ async function main(): Promise<void> {
           tokensBefore: outcome.tokensBefore,
           tokensAfter: outcome.tokensAfter,
         })
-        console.log(`[compact] ${outcome.removedCount} 条旧消息 → summary（${outcome.tokensBefore} → ${outcome.tokensAfter} tok est.）`)
+        console.log(`[compact] ${outcome.removedCount} 条旧消息 → summary（${outcome.tokensBefore} → ${outcome.tokensAfter} tok）`)
+      } else if (outcome.removedCount > 0) {
+        console.log(`[microcompact] 清理 ${outcome.removedCount} 条旧 tool_result`)
       }
 
       permissions.beginTurn()
+      activeTurn = new AbortController()
       try {
-        await agentloop({
+        const receipt = await agentloop({
           model,
           messages,
           cwd,
           permissions,
           maxSteps: 30,
           toolResultState,
+          signal: activeTurn.signal,
           
           onAssistantMessage: content => { console.log(`\n${content}\n`) },
           onProgressMessage: content => { console.log(`[progress] ${content}`) },
@@ -369,6 +462,9 @@ async function main(): Promise<void> {
             void appendSessionEvent(cwd, sessionId, 'turn_end', { ...info }).catch(() => {})
           },
         })
+        if (receipt.kind === 'aborted') {
+          console.log('[aborted] 本回合已取消，可继续输入')
+        }
         scheduleSave(cwd, sessionId, messages)
       } catch (error) {
         await appendSessionEvent(cwd, sessionId, 'error', {
@@ -377,6 +473,7 @@ async function main(): Promise<void> {
         }).catch(() => {})
         console.log(`\n[error] ${error instanceof Error ? error.message : String(error)}\n`)
       } finally {
+        activeTurn = null
         permissions.endTurn()
       }
     }

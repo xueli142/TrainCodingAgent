@@ -237,12 +237,14 @@ async function saveMessagesLocked(
   let parent = last?.id ?? null
   let seq = (last?.seq ?? -1) + 1
 
-  const fresh = messages.filter(
-    message =>
-      message.role !== 'system' &&
-      message.role !== 'tool' &&
-      !(message.id && savedMessageIds.has(message.id)),
-  )
+  const fresh: ChatMessage[] = []
+  const batchSeen = new Set<string>()
+  for (const message of messages) {
+    if (message.role === 'system' || message.role === 'tool') continue
+    if (message.id && (savedMessageIds.has(message.id) || batchSeen.has(message.id))) continue
+    if (message.id) batchSeen.add(message.id)
+    fresh.push(message)
+  }
 
   if (fresh.length === 0) {
     return 0
@@ -572,10 +574,9 @@ export async function resumeMessages(
     sliced = events.slice(0,idx)
   }
 
-  // 注意：这里对 events 而非 sliced 做投影，chunkId 的分片当前未生效（见下方说明）
-  const messages = projectMessages(events)
-  return messages.length > 0 ? messages : null
-}
+  //对 sliced（chunkId 之前的事件段）做投影：从中间点回滚/重放
+  const messages = projectMessages(sliced)
+  return messages.length > 0 ? messages : null}
 
 export async function sessionExists(
   cwd: string,

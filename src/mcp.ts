@@ -17,7 +17,7 @@ const CALL_TIMEOUT_MS = 30_000
 
 export type McpServerStatus = {
   name: string
-  status: 'connected' | 'failed'
+  status: 'connected' | 'failed' | 'disabled'
   toolCount: number
   error?: string
 }
@@ -124,8 +124,13 @@ export async function connectMcpServers(
 ): Promise<McpServerStatus[]> {
   await Promise.all(
     Object.entries(servers).map(async ([name, cfg]) => {
+      if (cfg.enabled === false) {
+        statusMap.set(name, { name, status: 'disabled', toolCount: 0 })
+        return
+      }
+      let client: Client | undefined
       try {
-        const client = await connectOne(cfg)
+        client = await connectOne(cfg)
         const defs = await listAllTools(client)
         clientMap.set(name, client)
         statusMap.set(name, { name, status: 'connected', toolCount: defs.length })

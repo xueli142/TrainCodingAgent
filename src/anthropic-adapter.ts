@@ -206,8 +206,8 @@ export class AnthropicModelAdapter implements ModelAdapter {
     }>,
   ) {}
 
-//next 是最小的对话单位，调用llm的原子化操作
-  async next(messages: ChatMessage[]): Promise<AgentStep> {
+//next 是最小的对话单位，调用llm的原子化操作；429/5xx/网络抖动指数退避重试，空响应补枪两次
+  async next(messages: ChatMessage[], signal?: AbortSignal): Promise<AgentStep> {
     const payload = toAnthropicMessages(messages)
     //return 返回一个轨迹记录
     traceRequest({
@@ -217,36 +217,72 @@ export class AnthropicModelAdapter implements ModelAdapter {
       tools: this.tools,
     })
     const url = `${BASE_URL.replace(/\/$/, '')}/v1/messages`
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'anthropic-version': '2026-06-01',
-        Authorization: `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        system: payload.system,
-        messages: payload.messages,
-        tools: this.tools,
-        max_tokens: 8192,
-        //extended thinking：THINKING_BUDGET=0 关闭；budget 必须小于 max_tokens
-        ...(THINKING_BUDGET > 0
-          ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } }
-          : {}),
-      }),
+    const body = JSON.stringify({
+      model: MODEL,
+      system: payload.system,
+      messages: payload.messages,
+      tools: this.tools,
+      max_tokens: 8192,
+      //extended thinking：THINKING_BUDGET=0 关闭；budget 必须小于 max_tokens
+      ...(THINKING_BUDGET > 0
+        ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } }
+        : {}),
     })
 
-    const data = (await readJsonBody(response)) as {
+    const MAX_HTTP_ATTEMPTS = 4
+    const MAX_EMPTY_ATTEMPTS = 3
+    let httpAttempts = 0
+    let emptyAttempts = 0
+    let data: {
       stop_reason?: string
       content?: AnthropicContentBlock[]
       usage?: AnthropicUsage
       error?: { message?: string }
-    }
+    } = {}
 
-    if (!response.ok) {
-      throw new Error(extractErrorMessage(data, response.status))
+    for (;;) {
+      let response: Response
+      try {
+        response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'anthropic-version': '2026-06-01',
+            Authorization: `Bearer ${API_KEY}`,
+          },
+          body,
+          signal,
+        })
+      } catch (error) {
+        if (signal?.aborted) throw error
+        httpAttempts += 1
+        if (httpAttempts >= MAX_HTTP_ATTEMPTS) {
+          throw new Error(`Model request failed after ${httpAttempts} attempts: ${error instanceof Error ? error.message : String(error)}`)
+        }
+        await sleep(backoffMs(httpAttempts))
+        continue
+      }
+
+      data = (await readJsonBody(response)) as typeof data
+
+      if (!response.ok) {
+        const retryable = response.status === 429 || response.status === 408 || response.status >= 500
+        if (retryable && httpAttempts < MAX_HTTP_ATTEMPTS) {
+          httpAttempts += 1
+          await sleep(retryDelayMs(response.headers.get('retry-after'), httpAttempts))
+          continue
+        }
+        throw new Error(extractErrorMessage(data, response.status))
+      }
+
+      if ((data.content?.length ?? 0) === 0) {
+        emptyAttempts += 1
+        if (emptyAttempts < MAX_EMPTY_ATTEMPTS) {
+          await sleep(500 * emptyAttempts)
+          continue
+        }
+      }
+      break
     }
 
     const toolCalls: ToolCall[] = []
@@ -312,6 +348,22 @@ export class AnthropicModelAdapter implements ModelAdapter {
       usage,
     }
   }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(8_000, 1_000 * 2 ** (attempt - 1))
+}
+
+function retryDelayMs(retryAfter: string | null, attempt: number): number {
+  const seconds = Number(retryAfter)
+  if (Number.isFinite(seconds) && seconds > 0 && seconds <= 60) {
+    return seconds * 1000
+  }
+  return backoffMs(attempt)
 }
 
 async function readJsonBody(response: Response): Promise<unknown> {

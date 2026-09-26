@@ -2,10 +2,14 @@ import type {
   PermissionPromptHandler,
   PermissionRequest,
 } from './permissionManager.js'
-import { readLine } from './tty-prompt.js'
+import { discardQueuedInput, readLine } from './tty-prompt.js'
 
 export function createPermissionPromptHandler(): PermissionPromptHandler {
   return async (request: PermissionRequest) => {
+    const dropped = discardQueuedInput()
+    if (dropped > 0) {
+      console.log(`[approval] 已丢弃回合中排队的 ${dropped} 行输入（防止抢答），需要请重新输入`)
+    }
     const lines = [
       '',
       `\u001b[33m\u26a0 approval required\u001b[0m  ${request.summary}  (kind=${request.kind})`,

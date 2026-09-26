@@ -7,23 +7,26 @@ import { replaceLargeToolResult, applyToolResultBudget, PendingToolResult, Conte
 //TODO aborted — 用户取消 failed — 失败 retry — 重试
 export type TurnDiagInfo = {
   step: number
-  kind: 'final' | 'empty' | 'tools' | 'max_steps'
+  kind: 'final' | 'empty' | 'tools' | 'max_steps' | 'aborted'
   calls?: number
   usage?: ProviderUsage
   stopReason?: string
 }
 
-const LOOP_GUARD_AFTER_REPEATS = 5
+export type TurnReceipt = {
+  addedCount: number
+  kind: 'final' | 'empty' | 'max_steps' | 'aborted'
+  usage?: ProviderUsage
+  stopReason?: string
+}
+
+export const LOOP_GUARD_AFTER_REPEATS = 10
 
 function isEmptyAssistantResponse(content: string): boolean {
   return content.trim().length === 0
 }
 
 async function executeTool(name: string, rawInput: unknown, context: ToolContent): Promise<ToolResult> {
- 
-  console.log('Name:', name)
-  console.log('Raw Input:', JSON.stringify(rawInput, null, 2))
-
   const tool = getTool(name)
   if (!tool) {
     return {
@@ -53,9 +56,9 @@ async function executeTool(name: string, rawInput: unknown, context: ToolContent
 /**
  * 
  * 
- * 合约（修复版）：
+ * 合约（收据版）：
  *  - 所有新消息【就地 push 进 args.messages】（共享数组）——回合中途调度器/压缩能看到真实进度
- *  - 返回值 = 仅本回合新增（增量），caller 不得再 push 回同一数组
+ *  - 返回值 = TurnReceipt（新增条数 + 结束类型 + usage），不回传消息本身——caller 回推在类型层已不可能
  *  - 完全相同的 (tool,input) 调用达 LOOP_GUARD_AFTER_REPEATS 次 → 注入 loop-guard 提示
  * 
  *  args权威定义了参数
@@ -68,15 +71,36 @@ export async function agentloop(args: {
   maxSteps?: number
 //  mcpTools?:
   toolResultState?: ContentReplacementState
+  signal?: AbortSignal
   onAssistantMessage?: (content: string, metadata?: { final?: boolean }) => void
   onProgressMessage?: (content: string) => void
   onThinking?: (content: string) => void
   onTurnDiags?: (info: TurnDiagInfo) => void
-}): Promise<ChatMessage[]> {
+}): Promise<TurnReceipt> {
   const messages = args.messages
   const maxSteps = args.maxSteps ?? 30
   const added: ChatMessage[] = []
   const callCounts = new Map<string, number>()
+
+  //回合唯一出口：发诊断 + 铸收据
+  const endTurn = (
+    step: number,
+    kind: TurnReceipt['kind'],
+    meta?: { usage?: ProviderUsage; stopReason?: string },
+  ): TurnReceipt => {
+    args.onTurnDiags?.({
+      step,
+      kind,
+      ...(meta?.usage ? { usage: meta.usage } : {}),
+      ...(meta?.stopReason ? { stopReason: meta.stopReason } : {}),
+    })
+    return {
+      addedCount: added.length,
+      kind,
+      ...(meta?.usage ? { usage: meta.usage } : {}),
+      ...(meta?.stopReason ? { stopReason: meta.stopReason } : {}),
+    }
+  }
   //append 这个函数使用都是添加上下文的操作
   const append = (...items: ChatMessage[]): void => {
     for (const item of items) {
@@ -99,7 +123,19 @@ export async function agentloop(args: {
   }
 //最大步数计数
   for (let step = 0; maxSteps > step; step++) {
-    const response = await args.model.next(messages)
+    if (args.signal?.aborted) {
+      return endTurn(step, 'aborted')
+    }
+    let response: Awaited<ReturnType<ModelAdapter['next']>>
+    try {
+      response = await args.model.next(messages, args.signal)
+    } catch (error) {
+      //fetch 被打断（Ctrl+C）：按用户取消收尾，不算错
+      if (args.signal?.aborted) {
+        return endTurn(step, 'aborted')
+      }
+      throw error
+    }
 
     if (response.type === 'assistant') {
       const isEmpty = isEmptyAssistantResponse(response.content)
@@ -109,7 +145,11 @@ export async function agentloop(args: {
       //progress 中间态：只作提示展示，不视为回合的最终回复
       if (!isEmpty && isProgress) {
         args.onProgressMessage?.(response.content)
-        append({ role: 'assistant_progress', content: response.content })
+        append({
+          role: 'assistant_progress',
+          content: response.content,
+          ...(response.usage ? { providerUsage: response.usage } : {}),
+        })
         continue
       }
 
@@ -119,25 +159,26 @@ export async function agentloop(args: {
       const assistantMessage: ChatMessage = {
         role: 'assistant',
         content: response.content,
-        ...(response.usage ? { usage: response.usage } : {}),
+        ...(response.usage ? { providerUsage: response.usage } : {}),
       }
       if (!isEmpty) {
         append(assistantMessage)
       }
       //最终输出
-      args.onTurnDiags?.({
-        step,
-        kind: 'final',
-        usage: response.usage,
+      return endTurn(step, 'final', {
+        ...(response.usage ? { usage: response.usage } : {}),
         ...(response.diagnostics?.stopReason ? { stopReason: response.diagnostics.stopReason } : {}),
       })
-      return added
     }
 
     if ((response.calls?.length ?? 0) === 0) {
       if (response.content && response.contentKind !== 'progress') {
         appendThinkingBlocks(response.thinkingBlocks)
-        append({ role: 'assistant_progress', content: response.content })
+        append({
+          role: 'assistant_progress',
+          content: response.content,
+          ...(response.usage ? { providerUsage: response.usage } : {}),
+        })
         args.onProgressMessage?.(response.content)
         args.onTurnDiags?.({
           step,
@@ -147,8 +188,7 @@ export async function agentloop(args: {
         })
         continue
       }
-      args.onTurnDiags?.({ step, kind: 'empty', usage: response.usage })
-      return added
+      return endTurn(step, 'empty', response.usage ? { usage: response.usage } : undefined)
     }
     //思考块和工具shu
     appendThinkingBlocks(response.thinkingBlocks)
@@ -157,10 +197,22 @@ export async function agentloop(args: {
       toolUseId: call.id,
       toolName: call.toolName,
       input: call.input,
+      ...(response.usage ? { providerUsage: response.usage } : {}),
     })))
 
     const toolResults: PendingToolResult[] = []
     for (const call of response.calls) {
+      //取消落地：本 step 内未执行的调用也必须配对回 tool_result，否则 tool_use 孤儿会炸下一次请求
+      if (args.signal?.aborted) {
+        toolResults.push({
+          role: 'tool_result',
+          toolUseId: call.id,
+          toolName: call.toolName,
+          content: '(turn aborted by user before this call ran)',
+          isError: true,
+        })
+        continue
+      }
       const key = `${call.toolName}\u0000${JSON.stringify(call.input ?? {})}`
       const count = (callCounts.get(key) ?? 0) + 1
       callCounts.set(key, count)
@@ -168,6 +220,7 @@ export async function agentloop(args: {
       const result = await executeTool(call.toolName, call.input, {
         cwd: args.cwd,
         permissions: args.permissions,
+        signal: args.signal,
       })
 
       let output = result.output
@@ -195,11 +248,13 @@ export async function agentloop(args: {
       usage: response.usage,
       ...(response.diagnostics?.stopReason ? { stopReason: response.diagnostics.stopReason } : {}),
     })
+    if (args.signal?.aborted) {
+      return endTurn(step, 'aborted')
+    }
   }
   //最大次数限制
-  args.onTurnDiags?.({ step: maxSteps, kind: 'max_steps' })
   const maxStepsNotice = `达到最大工具步数限制（${maxSteps}），已停止当前回合。`
   args.onAssistantMessage?.(maxStepsNotice, { final: true })
   append({ role: 'assistant', content: maxStepsNotice })
-  return added
+  return endTurn(maxSteps, 'max_steps')
 }

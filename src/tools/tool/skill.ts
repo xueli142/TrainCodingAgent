@@ -1,8 +1,10 @@
 import path from 'node:path'
+import os from 'node:os'
 import { readFile } from 'node:fs/promises'
 import { z } from 'zod'
 import type { ToolDefinition } from '../../tool.js'
 import { ICEFOX_CODE_DIR } from '../../config.js'
+import { findProjectRoot } from '../../environment.js'
 import { walkFiles } from './fs-walk.js'
 import { jsonSchemaOf } from './schema-io.js'
 
@@ -29,22 +31,50 @@ function parseFrontmatter(text: string): {
   }
 
   const fields = new Map<string, string>()
-  for (const line of match[1].split(/\r?\n/)) {
-    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line)
-    if (kv) {
-      fields.set(kv[1].toLowerCase(), kv[2].trim().replace(/^["']|["']$/g, ''))
+  const lines = match[1].split(/\r?\n/)
+  for (let i = 0; i < lines.length; i++) {
+    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(lines[i])
+    if (!kv) {
+      continue
     }
+    let value = (kv[2] ?? '').trim()
+    //YAML 块标量：| 保留换行、> 折叠成空格，-/+ 尾换行风格不影响解析
+    if (/^[|>][-+]?$/.test(value)) {
+      const folded = value[0] === '>'
+      const block: string[] = []
+      while (i + 1 < lines.length && (/^[ \t]+\S/.test(lines[i + 1]) || lines[i + 1].trim() === '')) {
+        i++
+        block.push(lines[i].replace(/^[ \t]{1,4}/, ''))
+      }
+      value = (folded ? block.join(' ') : block.join('\n')).trim()
+    }
+    fields.set(kv[1].toLowerCase(), value.replace(/^["']|["']$/g, ''))
   }
 
-  return {  
+  return {
     name: fields.get('name'),
     description: fields.get('description'),
     body: text.slice(match[0].length + 1),
   }
 }
 
-function skillRoots(cwd: string): string[] {
-  return [path.join(cwd, '.icefox', 'skills'), path.join(ICEFOX_CODE_DIR, 'skills')]
+/**
+ * 发现面（B1 拓宽）：项目级（cwd 起向上到 git 根的 .icefox/skills 与 .claude/skills）
+ * + 用户级（~/.ICEFOX-code/skills、~/.claude/skills）。先见者赢（项目优先于全局）。
+ */
+export function skillRoots(cwd: string): string[] {
+  const roots: string[] = []
+  const stop = findProjectRoot(cwd)
+  let dir = path.resolve(cwd)
+  for (;;) {
+    roots.push(path.join(dir, '.icefox', 'skills'), path.join(dir, '.claude', 'skills'))
+    if (stop && dir === stop) break
+    const parent = path.dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  roots.push(path.join(ICEFOX_CODE_DIR, 'skills'), path.join(os.homedir(), '.claude', 'skills'))
+  return [...new Set(roots)]
 }
 //这个返回的只是skill摘要（name/description/location），供 system prompt 目录使用；完整 body 由 SkillTool 按需加载
 export async function discoverSkills(cwd: string): Promise<SkillSummary[]> {
@@ -64,8 +94,13 @@ export async function discoverSkills(cwd: string): Promise<SkillSummary[]> {
       }
 
       const meta = parseFrontmatter(text)
-      const name = meta.name || path.basename(path.dirname(file))
+      const dirName = path.basename(path.dirname(file))
+      const name = meta.name || dirName
+      if (meta.name && meta.name !== dirName) {
+        console.warn(`[skills] name "${meta.name}" 与目录名 "${dirName}" 不一致: ${file}`)
+      }
       if (skills.has(name)) {
+        console.warn(`[skills] 重名被忽略（先到者生效）: ${name} @ ${file}`)
         continue
       }
 

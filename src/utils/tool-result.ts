@@ -38,6 +38,33 @@ export function createContentReplacementState(): ContentReplacementState {
   }
 }
 
+/** 豁免名单：skill 正文被替换等于丢指令、edit 返回的是小 diff，持久化替换只会帮倒忙 */
+export const EXEMPT_RESULT_TOOLS = new Set(['skill', 'edit'])
+
+/** 启动清理：删 7 天前的 tool-results 批次目录（现在永久堆积）；任何失败静默 */
+export async function pruneToolResults(maxAgeDays = 7): Promise<number> {
+  const root = path.join(ICEFOX_CODE_DIR, TOOL_RESULTS_SUBDIR)
+  const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000
+  let removed = 0
+  try {
+    const { readdir, rm, stat } = await import('node:fs/promises')
+    for (const entry of await readdir(root)) {
+      const dir = path.join(root, entry)
+      try {
+        if ((await stat(dir)).mtimeMs < cutoff) {
+          await rm(dir, { recursive: true, force: true })
+          removed += 1
+        }
+      } catch {
+        /* 目录已消失等 */
+      }
+    }
+  } catch {
+    /* 目录不存在 */
+  }
+  return removed
+}
+
 function sanitizePathSegment(value: string): string {
   const sanitized = value.replace(/[^a-zA-Z0-9._-]/g, '_')
   return sanitized.length > 0 ? sanitized : randomUUID()
@@ -154,6 +181,10 @@ export async function replaceLargeToolResult(
     content,
   }
 
+  if (EXEMPT_RESULT_TOOLS.has(result.toolName)) {
+    return normalizedResult
+  }
+
   const previousReplacement = state?.replacements.get(result.toolUseId)
   if (previousReplacement !== undefined) {
     return {
@@ -230,6 +261,13 @@ export async function applyToolResultBudget(
 
     if (content.trim().length === 0) {
       state.seenIds.add(result.toolUseId)
+      continue
+    }
+
+    //豁免工具的大结果计入预算但不做替换（没得换）
+    if (EXEMPT_RESULT_TOOLS.has(result.toolName)) {
+      state.seenIds.add(result.toolUseId)
+      visibleSize += content.length
       continue
     }
 

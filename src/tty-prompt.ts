@@ -48,3 +48,26 @@ export function readLine(prompt?: string): Promise<string | null> {
     waiters.push(resolve)
   })
 }
+
+/**
+ * 模态入口（审批卡/question）先洗掉排队中的旧行——否则回合里提前输入的行
+ * 会被下一张卡当答案吃掉（抢答）。丢弃前行数，调用方负责提示。
+ */
+export function discardQueuedInput(): number {
+  const dropped = queue.length
+  queue.length = 0
+  return dropped
+}
+
+/**
+ * 回合被取消时唤醒所有正挂在 readLine 上的等待者（审批卡/question），
+ * 以 null（等同 EOF）结算——审批卡按 deny 处理，inputSource 保持存活可继续输入。
+ */
+export function interruptWaiters(): number {
+  const pending = waiters
+  waiters = []
+  for (const waiter of pending) {
+    waiter(null)
+  }
+  return pending.length
+}

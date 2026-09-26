@@ -1,6 +1,6 @@
 {
-  "name": "claude-cli",
-  "version": "1.0.0",
+  "name": "icefox-agent",
+  "version": "0.1.0",
   "type": "module",
   "bin": {
     "icefox": "./bin/icefox.js"
@@ -8,12 +8,14 @@
   "scripts": {
     "prestart": "pnpm install",
     "start": "tsx src/index.ts",
-    "check-deps": "node scripts/check-deps.js"
+    "check": "tsc",
+    "test": "node --test --import tsx \"test/*.test.ts\""
   },
   "devDependencies": {
     "@types/diff": "^5.0.0",
     "@types/node": "^26.0.0",
-    "tsx": "^4.22.4"
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

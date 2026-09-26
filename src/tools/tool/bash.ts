@@ -1,15 +1,16 @@
 import { spawn } from 'node:child_process'
+import { openSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
-import type { ToolContent, ToolDefinition } from '../../tool.js'
+import type { ToolContent, ToolDefinition, ToolResult } from '../../tool.js'
 import { buildProcessEnvironment } from '../../environment.js'
 import { resolveToolPath } from '../../workspace.js'
 import { jsonSchemaOf } from './schema-io.js'
+import { ICEFOX_CODE_DIR } from '../../config.js'
 
 const DEFAULT_TIMEOUT_MS = 120_000
 const FORCE_KILL_GRACE_MS = 3_000
-const MAX_OUTPUT_LINES = 2_000
-const MAX_OUTPUT_BYTES = 50 * 1024
 
 const schema = z.object({
   command: z.string().describe('The command to execute'),
@@ -24,6 +25,12 @@ const schema = z.object({
     .optional()
     .describe(
       'The working directory to run the command in. Defaults to the current directory. Use this instead of cd commands.',
+    ),
+  background: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, detach the job immediately: output streams to a log file you can read with the read tool, returns pid/log path right away. Also auto-detected from a trailing &.',
     ),
 })
 
@@ -144,29 +151,11 @@ async function gateTouchedPaths(context: ToolContent, command: string, cwd: stri
   }
 }
 
-function tailLimit(text: string): { text: string; cut: boolean } {
-  const lines = text.split('\n')
-  const kept: string[] = []
-  let bytes = 0
-  let cut = false
-
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const size = Buffer.byteLength(lines[i], 'utf8') + (kept.length > 0 ? 1 : 0)
-    if (kept.length >= MAX_OUTPUT_LINES || bytes + size > MAX_OUTPUT_BYTES) {
-      cut = true
-      break
-    }
-    kept.unshift(lines[i])
-    bytes += size
-  }
-
-  return { text: kept.join('\n'), cut }
-}
-
 type RunOutcome = {
   text: string
   exitCode: number | null
   timedOut: boolean
+  aborted: boolean
   spawnError?: string
 }
 
@@ -175,6 +164,7 @@ function runShell(
   shellArgs: string[],
   cwd: string,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<RunOutcome> {
   return new Promise(resolve => {
     const child = spawn(shell, shellArgs, {
@@ -186,6 +176,7 @@ function runShell(
 
     const chunks: Buffer[] = []
     let timedOut = false
+    let aborted = false
     let settled = false
 
     const finish = (exitCode: number | null, spawnError?: string) => {
@@ -194,10 +185,12 @@ function runShell(
       }
       settled = true
       clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
       resolve({
         text: Buffer.concat(chunks).toString('utf8'),
         exitCode,
         timedOut,
+        aborted,
         spawnError,
       })
     }
@@ -241,6 +234,22 @@ function runShell(
       killTree()
       setTimeout(() => finish(null), FORCE_KILL_GRACE_MS + 500).unref()
     }, timeoutMs)
+
+    const onAbort = () => {
+      if (settled) {
+        return
+      }
+      aborted = true
+      killTree()
+      setTimeout(() => finish(null), FORCE_KILL_GRACE_MS + 500).unref()
+    }
+    if (signal) {
+      if (signal.aborted) {
+        onAbort()
+      } else {
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+    }
   })
 }
 
@@ -256,6 +265,44 @@ function shellForPlatform(): { shell: string; prefixArgs: string[] } {
 
 const PROC_ENV = buildProcessEnvironment()
 
+async function runBackground(
+  shell: string,
+  prefixArgs: string[],
+  command: string,
+  cwd: string,
+): Promise<ToolResult> {
+  const jobId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+  const jobsDir = path.join(ICEFOX_CODE_DIR, 'jobs')
+  await mkdir(jobsDir, { recursive: true })
+  const logPath = path.join(jobsDir, `${jobId}.log`)
+  const fd = openSync(logPath, 'a')
+  //sentinel：shell 收尾时往日志尾追一行退出码，模型据此判活/判死
+  const wrapped =
+    shell === 'powershell.exe'
+      ? `${command}\nWrite-Output "[icefox-job exited code $LASTEXITCODE]"`
+      : `${command}\necho "[icefox-job exited code $?]"`
+  const child = spawn(shell, [...prefixArgs, wrapped], {
+    cwd,
+    env: process.env,
+    stdio: ['ignore', fd, fd],
+    detached: true,
+    windowsHide: true,
+  })
+  child.unref()
+  const pid = child.pid ?? '?'
+  return {
+    ok: true,
+    output: [
+      `Started background job ${jobId} (pid ${pid}).`,
+      `Log: ${logPath}`,
+      'Check progress with the read tool on the log path; the log ends with "[icefox-job exited code N]".',
+      process.platform === 'win32'
+        ? `Kill via bash: taskkill /pid ${pid} /T /F`
+        : `Kill via bash: kill ${pid}`,
+    ].join('\n'),
+  }
+}
+
 export const BashTool: ToolDefinition<BashInput> = {
   name: 'bash',
   description: [
@@ -267,6 +314,7 @@ export const BashTool: ToolDefinition<BashInput> = {
     "- All commands run in the current working directory by default. Use the workdir parameter to change directory; do NOT cd inside the command string.",
     '- Quote file paths that contain spaces. Chain dependent commands with "&&" on unix shells and with `; if ($?) { cmd2 }` on Windows PowerShell.',
     '- If you need to run multiple independent commands in parallel, make multiple bash tool calls in a single response.',
+    '- For long-running work (dev servers, builds, watch), pass background:true (or end with &): you get a pid + log path immediately and can read the log later.',
     '- Before running commands that create files or directories, verify the parent path exists.',
     '- If a previous write/edit to a path was denied by the user, you MUST NOT recreate that effect via bash (Set-Content, Out-File, redirection, WriteAllText, rm, mv, ...). Denials are enforced at this tool and are final for the session.',
     '',
@@ -283,11 +331,27 @@ export const BashTool: ToolDefinition<BashInput> = {
 
     const timeout = input.timeout ?? DEFAULT_TIMEOUT_MS
 
-    await approveCommandSegments(context, input.command, cwd)
-    await gateTouchedPaths(context, input.command, cwd)
+    //尾随 & 自动识别为后台任务
+    const trimmedCommand = input.command.trimEnd()
+    const isBackground = input.background === true || /&$/.test(trimmedCommand)
+    const command = isBackground ? trimmedCommand.replace(/&$/, '').trimEnd() : trimmedCommand
+
+    await approveCommandSegments(context, command, cwd)
+    await gateTouchedPaths(context, command, cwd)
 
     const { shell, prefixArgs } = shellForPlatform()
-    const outcome = await runShell(shell, [...prefixArgs, input.command], cwd, timeout)
+
+    if (isBackground) {
+      return runBackground(shell, prefixArgs, command, cwd)
+    }
+
+    const outcome = await runShell(
+      shell,
+      [...prefixArgs, command],
+      cwd,
+      timeout,
+      context.signal,
+    )
 
     if (outcome.spawnError) {
       return {
@@ -296,25 +360,21 @@ export const BashTool: ToolDefinition<BashInput> = {
       }
     }
 
-    const trimmed = outcome.text.replace(/\r/g, '').trim()
-    const limited = tailLimit(trimmed)
+    const text = outcome.text.replace(/\r/g, '').trim()
+    const parts: string[] = [text.length > 0 ? text : '(no output)']
 
-    const parts: string[] = []
-    if (limited.cut) {
-      parts.push('... (earlier output truncated, showing the tail)')
-    }
-    parts.push(limited.text.length > 0 ? limited.text : '(no output)')
-
-    if (outcome.timedOut) {
+    if (outcome.aborted) {
+      parts.push('<shell_metadata>Command aborted by user (turn cancelled via Ctrl+C).</shell_metadata>')
+    } else if (outcome.timedOut) {
       parts.push(
-        `<shell_metadata>Command terminated after exceeding the ${timeout} ms timeout. If it legitimately needs longer, pass a larger timeout. User aborted the command.</shell_metadata>`,
+        `<shell_metadata>Command terminated after exceeding the ${timeout} ms timeout. If it legitimately needs longer, pass a larger timeout, use background:true, or split the command.</shell_metadata>`,
       )
     } else if (outcome.exitCode !== 0) {
       parts.push(`<shell_metadata>Exit code: ${outcome.exitCode}</shell_metadata>`)
     }
 
     return {
-      ok: !outcome.timedOut && outcome.exitCode === 0,
+      ok: !outcome.timedOut && !outcome.aborted && outcome.exitCode === 0,
       output: parts.join('\n\n'),
     }
   },

@@ -87,7 +87,7 @@ export type AgentStep =
     }
 
 export interface ModelAdapter {
-  next(messages: ChatMessage[]): Promise<AgentStep>
+  next(messages: ChatMessage[], signal?: AbortSignal): Promise<AgentStep>
 }
 
 export type CompressionResult = {

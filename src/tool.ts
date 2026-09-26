@@ -4,6 +4,8 @@ import { PermissionManager } from './permissionManager.js'
 export type ToolContent = {
   cwd: string
   permissions?: PermissionManager
+  //回合取消信号：长跑工具（bash/webfetch）应在 abort 时中止自身
+  signal?: AbortSignal
 }
 
 export type ToolDefinition<TInput> = {
