@@ -15,7 +15,6 @@ const {
   applyToolResultBudget,
   createContentReplacementState,
 } = await import('../src/utils/tool-result.js')
-const LOOP_GUARD_AFTER_REPEATS = 5
 
 function stubTool(name: string, onRun?: () => void) {
   registerTool({

@@ -24,6 +24,8 @@ export type McpServerStatus = {
 
 const statusMap = new Map<string, McpServerStatus>()
 const clientMap = new Map<string, Client>()
+//记住每个 server 的配置，供运行时 /mcp connect 重连
+const configMap = new Map<string, McpServerConfig>()
 
 export function getMcpStatus(): McpServerStatus[] {
   return [...statusMap.values()]
@@ -119,47 +121,83 @@ function publishTools(serverName: string, client: Client, defs: McpToolDef[]): v
   }
 }
 
+async function connectServer(name: string, cfg: McpServerConfig): Promise<McpServerStatus> {
+  configMap.set(name, cfg)
+  if (cfg.enabled === false) {
+    const disabled: McpServerStatus = { name, status: 'disabled', toolCount: 0 }
+    statusMap.set(name, disabled)
+    return disabled
+  }
+  let client: Client | undefined
+  try {
+    client = await connectOne(cfg)
+    const defs = await listAllTools(client)
+    clientMap.set(name, client)
+    const status: McpServerStatus = { name, status: 'connected', toolCount: defs.length }
+    statusMap.set(name, status)
+    publishTools(name, client, defs)
+
+    client.onclose = () => {
+      statusMap.set(name, { name, status: 'failed', toolCount: 0, error: 'connection closed' })
+      clientMap.delete(name)
+      unregisterToolsByPrefix(`mcp__${sanitize(name)}__`)
+    }
+    // 服务器清单热更新（ToolListChangedNotification）
+    client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
+      try {
+        const next = await listAllTools(client!)
+        statusMap.set(name, { name, status: 'connected', toolCount: next.length })
+        publishTools(name, client!, next)
+      } catch {
+        /* 保持旧清单 */
+      }
+    })
+    console.log(`[mcp] ${name}: connected, ${defs.length} tools`)
+    return status
+  } catch (error) {
+    await client?.close().catch(() => {})
+    const msg = error instanceof Error ? error.message : String(error)
+    const failed: McpServerStatus = { name, status: 'failed', toolCount: 0, error: msg }
+    statusMap.set(name, failed)
+    console.error(`[mcp] ${name}: ${msg}`)
+    return failed
+  }
+}
+
 export async function connectMcpServers(
   servers: Record<string, McpServerConfig>,
 ): Promise<McpServerStatus[]> {
-  await Promise.all(
-    Object.entries(servers).map(async ([name, cfg]) => {
-      if (cfg.enabled === false) {
-        statusMap.set(name, { name, status: 'disabled', toolCount: 0 })
-        return
-      }
-      let client: Client | undefined
-      try {
-        client = await connectOne(cfg)
-        const defs = await listAllTools(client)
-        clientMap.set(name, client)
-        statusMap.set(name, { name, status: 'connected', toolCount: defs.length })
-        publishTools(name, client, defs)
-
-        client.onclose = () => {
-          statusMap.set(name, { name, status: 'failed', toolCount: 0, error: 'connection closed' })
-          clientMap.delete(name)
-          unregisterToolsByPrefix(`mcp__${sanitize(name)}__`)
-        }
-        // 服务器清单热更新（ToolListChangedNotification）
-        client.setNotificationHandler(ToolListChangedNotificationSchema, async () => {
-          try {
-            const next = await listAllTools(client)
-            statusMap.set(name, { name, status: 'connected', toolCount: next.length })
-            publishTools(name, client, next)
-          } catch {
-            /* 保持旧清单 */
-          }
-        })
-        console.log(`[mcp] ${name}: connected, ${defs.length} tools`)
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error)
-        statusMap.set(name, { name, status: 'failed', toolCount: 0, error: msg })
-        console.error(`[mcp] ${name}: ${msg}`)
-      }
-    }),
-  )
+  await Promise.all(Object.entries(servers).map(([name, cfg]) => connectServer(name, cfg)))
   return getMcpStatus()
+}
+
+/** 运行时重连（/mcp connect <name>）：配置须已在启动时见过或本次传入 */
+export async function reconnectMcpServer(
+  name: string,
+  cfg?: McpServerConfig,
+): Promise<McpServerStatus> {
+  const config = cfg ?? configMap.get(name)
+  if (!config) {
+    const missing: McpServerStatus = { name, status: 'failed', toolCount: 0, error: 'no config for server' }
+    statusMap.set(name, missing)
+    return missing
+  }
+  await disconnectMcpServer(name)
+  return connectServer(name, { ...config, enabled: true })
+}
+
+/** 运行时断开（/mcp disconnect <name>）：关 client、摘工具、标 disabled */
+export async function disconnectMcpServer(name: string): Promise<void> {
+  const client = clientMap.get(name)
+  clientMap.delete(name)
+  unregisterToolsByPrefix(`mcp__${sanitize(name)}__`)
+  if (client) {
+    client.onclose = () => {}
+    await client.close().catch(() => {})
+  }
+  if (statusMap.get(name)?.status !== 'disabled') {
+    statusMap.set(name, { name, status: 'disabled', toolCount: 0 })
+  }
 }
 
 export async function disposeMcp(): Promise<void> {

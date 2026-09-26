@@ -27,34 +27,25 @@
 - [X] 工程卫生：`.gitattributes`（`* text=auto eol=lf`）；package.json 更名 `icefox-agent`、删坏的 `check-deps`、新增 `check`（devDep typescript 5.9，**首次全项目类型检查通过**）与 `test` 脚本；清理 5 个未注册遗留工具文件 + `test-tool.ts` + 空文件 `register.ts`/`checkroute.ts`/`search_file.ts`
 - [X] **冒烟测试起步**（node:test + tsx loader，ICEFOX_CODE_HOME 隔离到临时目录）：agentloop 增量合约 / loop-guard 只注入一次 / 双层预算字节级复放，3 用例全过
 
-## B1 · 体验补齐（~1-2 天）
+## B1 · 体验补齐（已完成 2026-09-26，check + 5 测试全绿 + 启动冒烟正常）
 
-- [ ] ⭐ **统一截断层**（参照 opencode Truncate + MiniCode tool-result-storage）：
-  - 工具返回原文，`executeTool` 统一做：超限 → 原始全文落 `tool-results/`，替换为「预览 + read(path, offset) 续读提示」；bash/webfetch 删内部截断（现在头部直接丢了）
-  - `skill`/`edit` 进豁免名单；`ToolResult` 加 `metadata.outputPath/truncated`
-  - `tool-results/` 加 7 天 TTL 启动清理（现在永久堆积）
-- [ ] ⭐ **后台任务**（参照 MiniCode run_command）：`bash` 加 `background?: boolean` + 尾随 `&` 自动识别；detached spawn → 日志落 `~/.ICEFOX-code/jobs/`；sentinel 记退出码；`process.kill(pid,0)` 探活；模型用 `read`/`kill` 即可闭环，不加新工具
-- [ ] `--resume` / `/resume` 可交互化：列编号 + 输序号回车即切（裸 `--resume` 启动时进选择）；id 支持前缀模糊匹配
-- [ ] 输入历史：`~/.ICEFOX-code/history.jsonl` 持久化 + ↑↓ 翻找
-- [ ] 模型请求重试：429/5xx 指数退避 + `Retry-After`（最多 3-5 次）；空响应重试 2 次
-- [ ] 手动 `/compact` 命令；microcompact（利用率过半时旧 tool_result 清成 `[cleared]` 占位）
-- [ ] ⭐ **token 计数校准 + 窗口感知**（现在只有 chars/3.5 假估算 + 256K 硬编码，真实 usage 只进诊断不进决策）：
-  - usage 挂到消息上：`agentloop` push assistant 消息时写入 `providerUsage`（type.ts 字段已留）
-  - **锚点+增量计数**：从后往前找最近一条新鲜 usage 作精确锚点，之后增量才用字符估；压缩/重排后把旧 usage 标脏（stale）不许再锚
-  - model→`{contextWindow, outputReserve}` 小表（留实际用的 3-5 个模型 + 未知兜底），`effectiveInput` 全局唯一定义，compact 触发、状态行、tool-result 预算共用
-  - 参考：MiniCode `utils/token-estimator.ts`（分角色字符率 2.0~3.5 + 三态 source 标记）与 `utils/model-context.ts`（映射表 + normal/warning/critical/blocked 四档）——**方案仅供参考，按 icefox 的极简风格裁剪实现，不照搬**
-- [ ] **skills 发现面拓宽**（对齐 Anthropic 规范 / opencode）：
-  - `skillRoots` 增加 `~/.claude/skills`（零迁移复用现成几百个技能）+ 项目级向上查找到 worktree 根
-  - frontmatter 解析升级：单行正则 → 完整 YAML（支持折行 description、列表字段）
-  - 校验 name 与目录名一致（规范要求）；重名策略从"首见即赢"改为显式警告
+- [X] ⭐ **回合截断（abort）**：回合中 **Ctrl+C 取消当前回合**而非退出程序——`AbortController` 贯穿 `agentloop`（step 前检查 / model.next catch AbortError / 批内剩余调用补配对 cancelled 结果，绝不留孤儿 tool_use）；审批卡与 question 被 `interruptWaiters()` 以 null 唤醒按拒绝处理；bash 接 signal 杀进程树、webfetch 用 `AbortSignal.any` 合并；空闲时 Ctrl+C 仍是退出。ESC 需 raw mode，留给 TUI L2
+- [X] ⭐ **统一截断层**：bash 删 tailLimit（2000 行/50KB 内部截断）、webfetch 删 100k 截断——工具回原文，全走 `replaceLargeToolResult`（50k）+ `applyToolResultBudget`（200k）落盘替换；`EXEMPT_RESULT_TOOLS={skill,edit}` 豁免；`pruneToolResults()` 7 天 TTL 启动清理。偏差：`ToolResult.metadata.outputPath` 未加——路径已内嵌替换文本（`read(path,offset)` 可用），双层表达反而要维护一致性
+- [X] ⭐ **后台任务**：`bash` 加 `background?:boolean` + 尾随 `&` 自动识别；detached spawn、日志流 `~/.ICEFOX-code/jobs/<id>.log`、shell 尾追 `[icefox-job exited code N]` sentinel；模型 `read` 看进展、bash kill 进程，零新工具
+- [X] `--resume`/`/resume` 可交互：裸 `--resume` 启动列编号供选择；`resolveSessionId` 统一支持 序号|完整id|唯一前缀
+- [X] 输入历史：`~/.ICEFOX-code/history.jsonl` 持久化（启动载入 200 条，提交即追加），readline `history` 选项给 ↑↓
+- [X] 模型请求重试：429/408/5xx/网络抛错 → `Retry-After` 优先否则 1/2/4s 指数退避（至多 4 次）；空响应补枪 2 次；abort 不参与重试
+- [X] 手动 `/compact`（`maybeCompactContext` 加 `force`）+ **microcompact**：利用率过半先把旧的、超出保留窗的大 `tool_result` 就地清成 `[cleared]`（盘上事实不动），不够再走 summary
+- [X] ⭐ **token 计数校准 + 窗口感知**（新建 `utils/token-estimator.ts`，按 icefox 风格裁剪 MiniCode 方案）：`agentloop` 把 usage 挂上 assistant 系消息（`providerUsage`，顺手修正了原来挂错到 `usage` 字段的类型谎言）；**锚点+增量**计数；compact 后 `markUsagesStale` 整批标脏；`model→{contextWindow,outputReserve}` 表（claude/deepseek/gpt/gemini/qwen + 128K 兜底），compact 触发从"256K 硬编码 chars/3.5"换成 `utilization ≥ 85%×effectiveInput`
+- [X] **skills 发现面拓宽**：`skillRoots` = 项目起向上至 git 根的 `.icefox/skills`+`.claude/skills` + `~/.ICEFOX-code/skills` + `~/.claude/skills`（零迁移复用 Claude 系技能）；frontmatter 支持块标量 `|`/`>`（折行 description 可解析）；name≠目录名、重名均显式 warn。**仍欠**：列表字段/嵌套 YAML（需要时再上真解析器）
 
-## B2 · MCP（v2 官方 SDK 版已落地，余债如下）
+## B2 · MCP（余债清偿 2026-09-26）
 
 已完成：`@modelcontextprotocol/sdk` 接入（stdio + StreamableHTTP）、分页 list、`mcp__server__tool` 命名 sanitize、description 头部 "MCP tool from server" 隐式标注、结果归一化（content+structuredContent+isError）、断线 onclose 摘僵尸、ToolListChanged 热更新、`server-everything`/`filesystem` 冒烟通过（含 -32602 错误通路）。
 
-- [ ] 配置外置：`~/.ICEFOX-code/mcp.json` + 项目 `.icefox/mcp.json` 合并读取（现为 `config.ts` 硬编码）；`enabled:false` 支持
-- [ ] `/mcp` 命令：展示 `getMcpStatus()`（连接态/工具数/错误），运行时 connect/disconnect
-- [ ] `disposeMcp` 挂更多退出路径（SIGTERM、异常退出目前只覆盖 SIGINT 与正常收尾）
+- [X] 配置外置：`loadMcpConfig` 合并 `~/.ICEFOX-code/mcp.json` + 项目 `.icefox/mcp.json`（支持 `mcpServers` 包裹层，与 Cursor 格式互通）；`enabled:false` 静默跳过；`config.ts` 内置项降为兜底默认
+- [X] `/mcp` 命令：彩色状态表（●/○/✗ + 工具数 + 错误）；**运行时开关** `reconnectMcpServer`/`disconnectMcpServer`（`/mcp connect|disconnect <name>`，断开即摘工具）
+- [X] 退出路径补全：SIGTERM → flushOnExit(含 disposeMcp)；`main().catch` 启动段抛错也 allSettled flush
 - [ ] 可选（遇到再说）：resources / prompts 元工具、OAuth（远程私有 server 鉴权）、progress 透传
 
 ## B3 · TUI（定位先行，效果型 UI 一律缓做）

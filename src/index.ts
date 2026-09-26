@@ -39,7 +39,7 @@ setDefaultResultOrder('ipv4first')
 initRegistry()
 import { setQuestionHandler } from './tools/tool/index.js'
 import { readLine,attachInputSource, discardQueuedInput, interruptWaiters } from './tty-prompt.js'
-import { connectMcpServers, disposeMcp, getMcpStatus } from './mcp.js'
+import { connectMcpServers, disconnectMcpServer, disposeMcp, getMcpStatus, reconnectMcpServer } from './mcp.js'
 
 setQuestionHandler(async (questions) => {
   const answers: string[] = []
@@ -188,6 +188,9 @@ async function main(): Promise<void> {
   }
   rl.on('SIGINT', onCtrlC)
   process.on('SIGINT', onCtrlC)
+  process.on('SIGTERM', () => {
+    void flushOnExit().finally(() => process.exit(143))
+  })
 
   let sessionId = newSessionId()
   let restored: ChatMessage[] = []
@@ -339,8 +342,20 @@ async function main(): Promise<void> {
         console.log(`permissions: ${getPermissionsPath()}`)
         continue
       }
-      //MCP 服务器状态（连接态 / 工具数 / 错误）
-      if (input === '/mcp') {
+      //MCP 服务器状态（连接态 / 工具数 / 错误）；/mcp connect|disconnect <name> 运行时开关
+      if (input === '/mcp' || input.startsWith('/mcp ')) {
+        const parts = input.slice(4).trim().split(/\s+/)
+        const sub = parts[0]
+        if (sub === 'connect' && parts[1]) {
+          const status = await reconnectMcpServer(parts[1])
+          console.log(`/mcp connect ${parts[1]} → ${status.status}${status.error ? `: ${status.error}` : ''}`)
+          continue
+        }
+        if (sub === 'disconnect' && parts[1]) {
+          await disconnectMcpServer(parts[1])
+          console.log(`/mcp disconnect ${parts[1]}：已断开并摘除工具（重连用 /mcp connect ${parts[1]}）`)
+          continue
+        }
         const statuses = getMcpStatus()
         if (statuses.length === 0) {
           console.log('未配置任何 MCP 服务器（~/.ICEFOX-code/mcp.json 或 .icefox/mcp.json）')
@@ -350,7 +365,7 @@ async function main(): Promise<void> {
           const mark = s.status === 'connected' ? '\u001b[32m●\u001b[0m' : s.status === 'disabled' ? '\u001b[90m○\u001b[0m' : '\u001b[31m✗\u001b[0m'
           console.log(`${mark} ${s.name}  ${s.status}${s.status === 'connected' ? ` (${s.toolCount} tools)` : ''}${s.error ? `  ${s.error}` : ''}`)
         }
-        console.log('改配置后重启生效；运行时 connect/disconnect 在 TODO')
+        console.log('用法: /mcp connect <name> | /mcp disconnect <name>')
         continue
       }
       // 重命名对话
@@ -407,6 +422,7 @@ async function main(): Promise<void> {
           '/exit              退出（空闲时 Ctrl+C / Ctrl+D 亦可；回合中 Ctrl+C 只取消回合）',
           '/clear             清空上下文并开新会话（旧会话保留在盘上）',
           '/sessions          列出本项目历史会话（当前带 *）',
+          '/mcp               MCP 服务器连接状态与工具数',
           '/rename <标题>     重命名当前会话',
           '/resume [id|序号]  切换会话（支持 id 前缀模糊）',
           '/compact           手动压缩上下文（micro 优先，必要时 summary）',
@@ -486,6 +502,9 @@ async function main(): Promise<void> {
 
 main().catch(error => {
   console.error(error)
-  process.exitCode = 1
+  //启动段（try/finally 之前）抛错也尽力 flush：trace/会话/MCP 子进程
+  void Promise.allSettled([flushTrace(), flushSessionSaves(), disposeMcp()]).finally(() => {
+    process.exitCode = 1
+  })
 })
 
