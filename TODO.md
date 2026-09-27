@@ -1,83 +1,88 @@
 # icefox-agent TODO
 
-> 2026-09-20 整理。对照 `icefox-agent-对比报告.md`（vs MiniCode / opencode）与最近几轮代码审查。
-> 原则：先还债 → 再补体验 → MCP → TUI。标 ⭐ 的为性价比最高项。
+> 每次大改动后同步本文件。原则：**先还债 → 再补体验 → MCP → TUI 表皮 → 运行时新状态**。
+> 验证基线：`pnpm check` + `pnpm test`（29 用例）+ 真机启动冒烟。
 
-## 已完成（本轮已落地，留档备查）
+## 🗺️ Plan · 路线规划（当前 → 远期）
 
-- [X] skills 目录注入系统提示（`discoverSkills` + `formatSkillsForPrompt`）
-- [X] `question` 工具接线（单读者 `readLine` 模态分发）
-- [X] 工具结果批量预算 + 稳定替换（`toolResultState` 接入 `agentloop`）
-- [X] `allow_once` 真·一次性（删死集合）、`/sessions` 标题 fallback（首条 user 截断）
-- [X] tty-prompt 重写：单读者 + waiters 队列 + EOF→null（全链路 null 语义）
-- [X] README 同步至当前真实行为
-- [X] `/rename`（rename 事件生产者）+ `/clear`（开新会话不删盘）+ `/help`；占位命令统一"提示+continue"
-- [X] **修复 `/resume` 污染旧会话的引用共享 bug**：`messages` 改 `let`，换会话时重绑新数组（压缩保持原地 splice）；`scheduleSave` 存引用，旧 job 不再看到新内容
-- [X] `executeTool` 调试 `console.log` 噪音移除
-- [X] extended thinking：请求带 `budget_tokens`（`THINKING_BUDGET=0` 关闭）+ 灰色 `[thinking]` 预览打印
+| 阶段 | 内容 | 状态 | 排序理由 |
+|---|---|---|---|
+| **P0 还债** | 收据合约 / 批内去重 / 防抢答 / trust 摘除 / 工程卫生 / 测试起步 | ✅ 完成（B0） | 不修的地基会毒化后面所有功能 |
+| **P1 体验** | abort / 统一截断层 / 后台任务 / 历史 / 重试 / compact 双层 / token 真感知 / skills 拓宽 / 真窗口 | ✅ 完成（B1） | 日常使用顺滑度 |
+| **P2 MCP** | v2 官方 SDK 全链路 + 配置外置 + /mcp 运行时开关 | ✅ 主体完成（B2，余债见下） | 生态接入 |
+| **P3 TUI 表皮** | 模态栈 / picker / 快捷键 / 状态行 | ✅ L1 完成（B3，余留见下） | 不做大屏、只补操作效率 |
+| **P4 运行时状态** | plan mode → plan_exit 确认闸 → goal 状态机 | ⏳ 下一个动工 | 有 B3 的 picker 做 UI 承载，有权限层做 enforcement |
+| **P5 占位转正** | `/model` `/delete` `/init` 实装、`task` 接线 | 📋 排队 | 独立小件，随需插队 |
+| 远期评估 | 流式输出（先设计事件模型）、MCP resources/prompts/OAuth、全屏 L2 | ❄️ 冻结 | 出现真实痛点再解冻 |
 
-## B0 · 还债（已完成 2026-09-26，`pnpm check` + `pnpm test` 全绿）
+**P4 是下一铲**：三件套（mode 规则集 / plan_exit 确认闸 / todowrite 衔接）设计已定稿，见 B4。
 
-- [X] ⭐ `agentloop` 返回值改**收据**：`Promise<TurnReceipt>`（`addedCount / kind / stopReason? / usage?`），消息只就地 push，caller 回推在类型层已不可能；新增 `test/agent-loop.test.ts` 锁合约
-- [X] `saveMessagesLocked` 批内去重：过滤循环同步回填 `batchSeen`，同数组重复 id 不再双双落盘
-- [X] 弹卡抢答：`tty-prompt.discardQueuedInput()`，审批卡与 question 弹前洗掉排队行并提示丢弃数
-- [X] trust 闭环 → 选**摘装饰**：删 `trustProject`/`readTrustList`/`ProjectEnvironment.trusted`/环境块 trusted 行/`context_snapshot.trusted` 字段，启动日志改显 `(git)`。若将来做真 trust，需要连 PermissionManager 的持久化策略一起设计
-- [X] `getPermissionsPath`：接进 `/sessions` 尾行展示
-- [X] `resumeMessages` 的 `chunkId`：选**实现**——投影改用 `sliced`（chunk 首事件之前的段），回滚/中间点重放从此可用（无调用方，纯补能力）
-- [X] 工程卫生：`.gitattributes`（`* text=auto eol=lf`）；package.json 更名 `icefox-agent`、删坏的 `check-deps`、新增 `check`（devDep typescript 5.9，**首次全项目类型检查通过**）与 `test` 脚本；清理 5 个未注册遗留工具文件 + `test-tool.ts` + 空文件 `register.ts`/`checkroute.ts`/`search_file.ts`
-- [X] **冒烟测试起步**（node:test + tsx loader，ICEFOX_CODE_HOME 隔离到临时目录）：agentloop 增量合约 / loop-guard 只注入一次 / 双层预算字节级复放，3 用例全过
+## 待办清单
 
-## B1 · 体验补齐（已完成 2026-09-26，check + 5 测试全绿 + 启动冒烟正常）
+### B2 · MCP 余债
 
-- [X] ⭐ **回合截断（abort）**：回合中 **Ctrl+C 取消当前回合**而非退出程序——`AbortController` 贯穿 `agentloop`（step 前检查 / model.next catch AbortError / 批内剩余调用补配对 cancelled 结果，绝不留孤儿 tool_use）；审批卡与 question 被 `interruptWaiters()` 以 null 唤醒按拒绝处理；bash 接 signal 杀进程树、webfetch 用 `AbortSignal.any` 合并；空闲时 Ctrl+C 仍是退出。ESC 需 raw mode，留给 TUI L2
-- [X] ⭐ **统一截断层**：bash 删 tailLimit（2000 行/50KB 内部截断）、webfetch 删 100k 截断——工具回原文，全走 `replaceLargeToolResult`（50k）+ `applyToolResultBudget`（200k）落盘替换；`EXEMPT_RESULT_TOOLS={skill,edit}` 豁免；`pruneToolResults()` 7 天 TTL 启动清理。偏差：`ToolResult.metadata.outputPath` 未加——路径已内嵌替换文本（`read(path,offset)` 可用），双层表达反而要维护一致性
-- [X] ⭐ **后台任务**：`bash` 加 `background?:boolean` + 尾随 `&` 自动识别；detached spawn、日志流 `~/.ICEFOX-code/jobs/<id>.log`、shell 尾追 `[icefox-job exited code N]` sentinel；模型 `read` 看进展、bash kill 进程，零新工具
-- [X] `--resume`/`/resume` 可交互：裸 `--resume` 启动列编号供选择；`resolveSessionId` 统一支持 序号|完整id|唯一前缀
-- [X] 输入历史：`~/.ICEFOX-code/history.jsonl` 持久化（启动载入 200 条，提交即追加），readline `history` 选项给 ↑↓
-- [X] 模型请求重试：429/408/5xx/网络抛错 → `Retry-After` 优先否则 1/2/4s 指数退避（至多 4 次）；空响应补枪 2 次；abort 不参与重试
-- [X] 手动 `/compact`（`maybeCompactContext` 加 `force`）+ **microcompact**：利用率过半先把旧的、超出保留窗的大 `tool_result` 就地清成 `[cleared]`（盘上事实不动），不够再走 summary
-- [X] ⭐ **token 计数校准 + 窗口感知**（新建 `utils/token-estimator.ts`，按 icefox 风格裁剪 MiniCode 方案）：`agentloop` 把 usage 挂上 assistant 系消息（`providerUsage`，顺手修正了原来挂错到 `usage` 字段的类型谎言）；**锚点+增量**计数；compact 后 `markUsagesStale` 整批标脏；`model→{contextWindow,outputReserve}` 表（claude/deepseek/gpt/gemini/qwen + 128K 兜底），compact 触发从"256K 硬编码 chars/3.5"换成 `utilization ≥ 85%×effectiveInput`
-- [X] **skills 发现面拓宽**：`skillRoots` = 项目起向上至 git 根的 `.icefox/skills`+`.claude/skills` + `~/.ICEFOX-code/skills` + `~/.claude/skills`（零迁移复用 Claude 系技能）；frontmatter 支持块标量 `|`/`>`（折行 description 可解析）；name≠目录名、重名均显式 warn。**仍欠**：列表字段/嵌套 YAML（需要时再上真解析器）
-
-## B2 · MCP（余债清偿 2026-09-26）
-
-已完成：`@modelcontextprotocol/sdk` 接入（stdio + StreamableHTTP）、分页 list、`mcp__server__tool` 命名 sanitize、description 头部 "MCP tool from server" 隐式标注、结果归一化（content+structuredContent+isError）、断线 onclose 摘僵尸、ToolListChanged 热更新、`server-everything`/`filesystem` 冒烟通过（含 -32602 错误通路）。
-
-- [X] 配置外置：`loadMcpConfig` 合并 `~/.ICEFOX-code/mcp.json` + 项目 `.icefox/mcp.json`（支持 `mcpServers` 包裹层，与 Cursor 格式互通）；`enabled:false` 静默跳过；`config.ts` 内置项降为兜底默认
-- [X] `/mcp` 命令：彩色状态表（●/○/✗ + 工具数 + 错误）；**运行时开关** `reconnectMcpServer`/`disconnectMcpServer`（`/mcp connect|disconnect <name>`，断开即摘工具）
-- [X] 退出路径补全：SIGTERM → flushOnExit(含 disposeMcp)；`main().catch` 启动段抛错也 allSettled flush
 - [ ] 可选（遇到再说）：resources / prompts 元工具、OAuth（远程私有 server 鉴权）、progress 透传
 
-## B3 · TUI（定位先行，效果型 UI 一律缓做）
+### B3 · TUI 余留
 
-**设计立场**（2026-09-24 定，参考 MiniCode 自研行 diff / opencode 事件投影两条路线的调研结论）：
+- [ ] 多行 prompt（状态行+`> `）依赖 readline 兼容性，异常终端错位再评估自绘输入行
+- [ ] 心跳刷新等真上流式输出时一并设计
+- [ ] L2（冻结）：自绘全屏 raw mode + 行级 diff 重绘，教材 MiniCode `tty-app.ts`/`screen.ts:53-85`；先守"键击只写 input 缓冲、回调只写 transcript"的无锁纪律
+- [ ] ❌ 永不做：Ink/OpenTUI（React 依赖与"极简可通读"冲突）
+- [ ] 纪律：**UI 只订阅 `onAssistantMessage`/`onProgressMessage`/`onThinking`/`onTurnDiags` 事件流**，不读 agentloop 内部状态——事件流即投影源，L2 时只搬 REPL，主循环不动
 
-- **TUI = 落盘事件的投影，不是独立状态系统**。icefox 已有全量事件日志（`appendSessionEvent`/`readEvents`/`projectMessages`），所有展示内容应可从这个事件流推导——opencode 证明了这条路的终态是"TUI 无状态、server 是唯一事实源，重启即恢复视图"；我们同进程，等价做法是渲染层只读事件+派生状态
-- **TUI 的另一半价值是便捷命令系统**：slash 快捷命令体系（补全、`/status`、`/mcp`、会话操作），相比裸 CLI 提升操作效率——这是 L1 的主线
-- **效果型 UI 先缓**：备用屏全屏重绘、鼠标选区复制、ctx 十格条动画、diff viewer、sidebar、leader-key 键位系统——两个前辈都有，但对 2k 行工具是负债，出现真实痛点再说
+### B4 · plan 与 goal（下一个动工）
 
-待办：
+设计立场：**人工关口分两种**——否决闸（veto：默认放行、行为可疑才拦、可积累记忆，现有三把闸）与确认闸（consent：默认什么都不发生、人点头才推进、每次新决策不可积累）。plan 属于后者，不塞进 ensureXxx。
 
-- [ ] **L1 事件投影 + 命令系统（主线，~1-2 天）**：
-  - 状态行（session / model / ctx 利用率——数据源等 B1 token 校准落地，两任务串成链）
-  - slash 补全 + `/status`；审批卡配色（保持 readline，opencode 的"内联非模态"优于 MiniCode 的全屏替换）
-  - 渲染侧合帧：借鉴 opencode 的 16ms 事件队列 + 单次 batch 应用（约 10 行，防流式刷屏卡顿）
-- [ ] L2（暂缓，另立项再评估）：自绘全屏 raw mode + 行级 diff 重绘，教材 MiniCode `tty-app.ts`/`screen.ts:53-85`；真要做先守输入事件 promise 链串行化（键击只写 input 缓冲、agent 回调只写 transcript，天然无锁）
-- [ ] ❌ 不上 Ink/OpenTUI：React 依赖与"极简可通读"冲突
-- [ ] 纪律（现在就守）：**UI 只订阅 `onAssistantMessage`/`onProgressMessage`/`onTurnDiags` 事件流，不读 agentloop 内部状态**——事件流即投影源，L2 时只搬 REPL，主循环不动
+- [ ] **① plan mode = PermissionManager 换规则集**（~30 行，先做，让 plan 有牙齿）：
+  - `mode: 'build' | 'plan'`；三把闸顶部加判定：plan 模式下变更类动作 → throw "plan 模式禁止变更，继续以文字规划"
+  - enforcement 复用审批通道（permissionUi/模态栈/interruptWaiters 零新增弹卡原语；opencode 同构）
+  - mode 切换落 session 事件，`/resume` 恢复带回
+- [ ] **② `plan_exit` 工具 = 确认闸**：弹特殊审批卡（完整 plan 文本 + 步骤清单），选项 `[a]批准并切 build / [e]给修改意见 / [r]否决`；**fail-closed**：取消/EOF→未批准；不进持久 allow（每次必弹）
+- [ ] **③ plan 批准后接 todowrite**：人点头的对象是可勾选清单；执行逐步勾销；goal 状态机（planning→executing→reviewing）长在这条链上
+- [ ] 坑位：**确认闸每步一弹=审批疲劳**（批一次，执行期拦截归三把闸）；plan→build 必过闸，build→plan 随意
+- [ ] `/plan` `/build` slash 命令作人工兜底（模型自评转换是主路径）
+- [ ] goal 控制器：plan 三件套落地后再设计，避免一次引入两层新状态
 
-## B4 · runtime状态追加，goal和plan
+### B5 · 占位转正与小件
 
+- [ ] `/model <id>`：切模型 + 重建 system + **重新 hydrate 窗口**（现在窗口只在启动时拉一次）
+- [ ] `/delete <id>`：接现成 `clearSession` + 二次确认（确认对象非当前会话，或提示先 `/clear`）
+- [ ] `/init`：扫描项目生成 AGENTS.md 风格指令文件
+- [ ] `task` 子代理接线：嵌套 agentloop + 受限工具集（task.ts 注释里留有设计）
+- [ ] skills 列表字段/嵌套 YAML（需要时上真解析器）
+- [ ] `config.ts` 删无人使用的 `RuntimeConfig` 类型
 
+### 已知坑（别被源码骗到，详见 AGENTS.md 第 5 节）
 
+- [ ] resume 后 tool_result 阈值/形态与实时不一致（25k 文本 vs 50k/200k 块）——字节级复现在 resume 边界断裂，需要时统一
+- [ ] tool-results 子目录是随机 uuid，无法反查会话归属
+- [ ] `getStandardToolSchemas` 与 `getToolSchemas` 重复、`ToolRegistry` 类与 Map registry 并存——双轨待合流
 
+## 归档 · 已完成（时间倒序，只留一句话）
 
+### 2026-09-28（窗口真值化收尾）
+- [X] 模型窗口强制查 `/models`（候选链 MODELS_URL→base/models→去后缀→origin），**删内置猜测表**，失败统一 1M 兜底并明说；`formatTokens`（/1000 四舍五入，<1M 用 K、≥1M 用 M）统一状态行与 /status
+- [X] keypress 监听对象修正（rl 不转发 keypress，须听 stdin 流本身）+ 真 readline 回归测试；`flushTypedInput` 单 key 对象修正；picker Enter 微任务拆栈防抢答
+
+### 2026-09-26（B3 L1 表皮 + B1/B2 清偿）
+- [X] 模态栈键路由（pushModal/onKey/onLine/onClose + interruptWaiters/EOF 关模态 + deliverLine/onGlobalKey）；picker 组件（方向键/单键直达/Esc=fail-closed deny/Ctrl+O 展开 diff）；Tab slash 补全；Ctrl+G/L；状态行（session·model·ctx 真感知·mcp）+ 每 step 重打；`/status`
+- [X] abort（Ctrl+C 回合中取消：AbortController 贯穿 + 批内配对 cancelled + interruptWaiters 唤醒待答卡）；统一截断层（bash/webfetch 删内部截断、skill/edit 豁免、TTL 7 天）；后台任务（background/`&` + jobs 日志 + sentinel）；输入历史；模型重试（429/5xx 退避 + 空响应补枪）；`/compact`+microcompact；token 锚点+增量计数 + providerUsage 上消息；skills 拓宽（.claude + 向上查找 + 块标量 + 重名警告）
+- [X] MCP：配置外置双级合并（兼容 Cursor `mcpServers`）+ enabled + `/mcp` 状态表与运行时 connect/disconnect + SIGTERM/main().catch 退出路径
+- [X] B0：TurnReceipt 收据合约 / 批内去重 / 弹卡防抢答 / trust 摘装饰 / getPermissionsPath 接 /sessions / chunkId 实现 / 工程卫生（更名 icefox-agent、typescript+check、node:test 起步）/ 遗留文件清理
+- [X] loop-guard 阈值 3→10（与文档同步）
+
+### 更早（详见 git log）
+- [X] skills 注入 / question 接线 / 批量预算 / tty-prompt 单读者重写 / `/rename` `/clear` `/sessions` / `/resume` 引用共享 bug 修复 / extended thinking（THINKING_BUDGET 可关）/ MCP v2（官方 SDK、sanitize 命名、MCP tool 隐式标注、断线摘僵尸、热更新）
 
 ## 架构备忘（别回退）
 
-- **一条消息只能有一个提交点**：agentloop 就地 push 共享数组（崩溃窗口 ≤1s 的来源），返回值 = 仅增量，caller 不得回推（历史双提交点 bug：重复的 tool_use 破坏配对折叠 → 模型连环重试，重复还能双双落盘、跨重启存活）
-- **引用纪律**：`scheduleSave` 存数组引用——换会话（/resume、/clear）**重绑**新数组，压缩（同会话）**原地 splice**；两种写法各自只对一种场景正确
+- **一条消息只能有一个提交点**：agentloop 就地 push 共享数组，返回 `TurnReceipt`（崩溃窗口 ≤1s 的来源）——caller 回推在类型层已不可能（历史双提交点 bug：重复 tool_use 破坏配对 → 连环重试、双双落盘、跨重启存活）
+- **引用纪律**：`scheduleSave` 存数组引用——换会话**重绑**新数组，压缩**原地 splice**；两种写法各自只对一种场景正确
 - 事实与现场分离：盘上永远全量事件，进上下文的只是投影；压缩失败 = 放弃本轮，绝不丢消息
-- 权限两条通道都要有：人的通道（审批卡/单读者）+ 模型的通道（文案 + bash 硬闸 + 记忆规则）
+- 权限两条通道都要有：人的通道（审批卡/picker/单读者）+ 模型的通道（文案 + bash 硬闸 + 记忆规则）
 - `deny` 记忆不可被任何 bash 形态洗掉（gateTouchedPaths 与 write 共用同一把闸）
+- 人工关口分两种：veto（三闸，可积累记忆）与 consent（plan/plan_exit，每次必弹、fail-closed）——不要互相塞
+- 模态栈铁律：keypress 听 stdin 流本身（rl 不转发）；Enter 伴生 line 靠"栈顶不接线即丢弃"+微任务拆栈消化
 - 流式输出暂不做：非流式对 DeepSeek 类网关够用且少一整层复杂度；要做时先设计事件模型再动手

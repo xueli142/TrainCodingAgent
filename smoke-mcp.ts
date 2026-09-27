@@ -10,7 +10,7 @@ const mcpTools = getAllTool().filter(t => t.name.startsWith('mcp__'))
 console.log(`registered ${mcpTools.length} mcp tools`)
 console.log('meta tools:', getAllTool().filter(t => t.name.includes('mcp_') && !t.name.startsWith('mcp__')).map(t => t.name).join(', '))
 
-const sample = mcpTools.find(t => t.name.includes('get_sum')) ?? mcpTools[0]
+const sample = mcpTools.find(t => t.name.toLowerCase().includes('sum')) ?? mcpTools[0]
 if (sample) {
   const r = await sample.run({ a: 2, b: 40 }, { cwd: process.cwd() })
   console.log(`call ${sample.name} ->`, r.ok, '|', r.output.slice(0, 150))
@@ -24,3 +24,6 @@ if (listPrompts) {
 
 await disposeMcp()
 process.exit(0)
+
+
+

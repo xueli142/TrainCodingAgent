@@ -2,40 +2,32 @@ import type {
   PermissionPromptHandler,
   PermissionRequest,
 } from './permissionManager.js'
-import { discardQueuedInput, readLine } from './tty-prompt.js'
+import { readLine } from './tty-prompt.js'
+import { pick } from './picker.js'
 
 export function createPermissionPromptHandler(): PermissionPromptHandler {
   return async (request: PermissionRequest) => {
-    const dropped = discardQueuedInput()
-    if (dropped > 0) {
-      console.log(`[approval] 已丢弃回合中排队的 ${dropped} 行输入（防止抢答），需要请重新输入`)
+    const detail = [...request.details, `scope: ${request.scope}`]
+    const index = await pick({
+      title: `approval required — ${request.summary}  (kind=${request.kind})`,
+      options: request.choices.map(choice => ({
+        key: choice.key,
+        label: choice.label,
+        hint: choice.decision,
+        danger: choice.decision.startsWith('deny'),
+        detail,
+      })),
+    })
+    if (index === null) {
+      // Esc / Ctrl+C / EOF：fail-closed，取消即拒绝
+      return { decision: 'deny_once' }
     }
-    const lines = [
-      '',
-      `\u001b[33m\u26a0 approval required\u001b[0m  ${request.summary}  (kind=${request.kind})`,
-      ...request.details.map(detail => `    ${detail}`),
-      `    scope: ${request.scope}`,
-      `    ${request.choices.map(c => `[${c.key}] ${c.label}`).join('   ')}`,
-    ]
-    console.log(lines.join('\n'))
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const answer = await readLine('choose> ')
-      if (answer === null) {
-        return { decision: 'deny_once' }
-      }
-      const chosen = request.choices.find(c => c.key === answer.trim())
-      if (!chosen) {
-        console.log('invalid choice')
-        continue
-      }
-      if (chosen.decision === 'deny_with_feedback') {
-        //readLine 返回 Promise<string | null>：await 取值，EOF 兜底成空反馈
-        const feedback = (await readLine('guidance to model> '))?.trim() ?? ''
-        return { decision: chosen.decision, feedback }
-      }
-      return { decision: chosen.decision }
+    const chosen = request.choices[index]
+    if (chosen.decision === 'deny_with_feedback') {
+      // 自由文本仍走行输入（picker 管不了多字输入），EOF 兜底成空反馈
+      const feedback = (await readLine('guidance to model> '))?.trim() ?? ''
+      return { decision: chosen.decision, feedback }
     }
-    return { decision: 'deny_once' }
+    return { decision: chosen.decision }
   }
 }

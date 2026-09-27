@@ -1,6 +1,6 @@
 # AGENTS.md — icefox-agent
 
-> 供 AI 协作者阅读的项目实况文档。基于 2026-09-25 全量代码扫描写成，行号会随改动漂移，以符号名搜索为准。
+> 供 AI 协作者阅读的项目实况文档。2026-09-25 全量代码扫描写成，B0-B2 后同步至 2026-09-26；行号会随改动漂移，以符号名搜索为准。
 > README 面向使用者，本文面向改代码的人：**模块地图、主流程、数据布局、纪律、已知的坑**。
 
 ## 1. 定位与原则
@@ -10,18 +10,20 @@
 ```
 pnpm start                 # 交互式 REPL（先跑 pnpm install）
 pnpm start -- --sessions   # 列历史会话
-pnpm start -- --resume [id]
+pnpm start -- --resume [id|序号|前缀]   # 裸 --resume 进编号选择
+pnpm check                 # tsc 类型检查（noEmit）
+pnpm test                  # node:test 全套
 npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子）
 ```
 
-`.env` 必需：`MODEL` / `API_KEY` / `BASE_URL`（走 `Authorization: Bearer`，非官方 x-api-key）；可选 `THINKING_BUDGET`（默认 2048，`0` 关闭 extended thinking）、`ICEFOX_TRACE=0`（关 trace）、`ICEFOX_CODE_HOME`（改数据根目录）。
+`.env` 必需：`MODEL` / `API_KEY` / `BASE_URL`（走 `Authorization: Bearer`，非官方 x-api-key）；可选 `THINKING_BUDGET`（默认 2048，`0` 关闭 extended thinking）、`MODELS_URL`（覆盖模型列表地址；不填则按 `BASE_URL` 推导 `${base}/models` → 去 `/anthropic|/v1` 后缀的根 → origin）、`ICEFOX_TRACE=0`（关 trace）、`ICEFOX_CODE_HOME`（改数据根目录）。
 
 ## 2. 模块地图
 
 ### 入口与装配（composition root）
 | 文件 | 职责 |
 |---|---|
-| `src/index.ts` | REPL + 装配根。启动时序：`initRegistry()`(静态工具) → `discoverSkills` → `PermissionManager.whenReady` → **`connectMcpServers(loadMcpConfig(cwd))`** → `new AnthropicModelAdapter(getToolSchemas())`（⚠️ 工具在此快照，MCP 必须先注册）→ system/catalog 组装 → `resumeMessages` 恢复 → readline 循环。斜杠命令：`/exit /clear /sessions /rename /resume /compact /mcp /help` 已实现；`/delete /model /init` 是占位。**Ctrl+C 双语义**：回合中=取消当前回合（AbortController+interruptWaiters），空闲=退出。输入历史 `history.jsonl` 持久化 + ↑↓ |
+| `src/index.ts` | REPL + 装配根。启动时序：`initRegistry()`(静态工具) → `discoverSkills` → `PermissionManager.whenReady` → **`connectMcpServers(loadMcpConfig(cwd))`** → `new AnthropicModelAdapter(getToolSchemas())`（⚠️ 工具在此快照，MCP 必须先注册）→ system/catalog 组装 → `resumeMessages` 恢复 → readline 循环。斜杠命令：`/exit /clear /sessions /rename /resume /compact /mcp /status /help` 已实现；`/delete /model /init` 是占位。**Ctrl+C 双语义**：回合中=取消当前回合（AbortController+interruptWaiters），空闲=退出。输入历史 `history.jsonl` 持久化 + ↑↓。**TUI 三件套（B3 L1）**：prompt 前置状态行（`statusLine()`：session/model/ctx 利用率/mcp 就绪数）+ Tab slash 补全（readline completer）+ 空闲全局键 Ctrl+G 会话选择器 / Ctrl+L 重绘；回合中每个 tools step 经 onTurnDiags 重打状态行 |
 | `bin/icefox.js` | 薄壳：`icefox start` → `pnpm start` |
 | `src/config.ts` | env 常量 + `ICEFOX_CODE_DIR` + `McpServerConfig` 类型（含 enabled）+ **`loadMcpConfig(cwd)`**：用户级 `~/.ICEFOX-code/mcp.json` 与项目级 `.icefox/mcp.json` 合并（支持 Cursor 的 `mcpServers` 包裹），内置 `DEFAULT_MCP_SERVERS` 兜底；`RuntimeConfig` 类型无人使用 |
 
@@ -41,7 +43,7 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 ### 工具系统
 | 文件 | 职责 |
 |---|---|
-| `src/tool.ts` | `ToolDefinition`（name/description/inputSchema JSON Schema + zod schema + run）、`ToolContent {cwd, permissions}`、`ToolRegistry`（另一个类，实际 REPL 用的是下面 Map 版） |
+| `src/tool.ts` | `ToolDefinition`（name/description/inputSchema JSON Schema + zod schema + run）、`ToolContent {cwd, permissions, signal?}`（signal 为回合取消信号，长跑工具应自觉接）、`ToolRegistry`（另一个类，实际 REPL 用的是下面 Map 版） |
 | `src/tools/index.ts` | **registry 事实本体**：模块级 `Map` + `initRegistry/registerTool/unregisterToolsByPrefix/getTool/getToolSchemas`；渐进披露：`buildToolCatalogMessage()` 生成 name+首行摘要的目录消息进上下文，完整 schema 走 API tools 参数。`NOT_WIRED_TOOLS={task,question}` 是静态提示名单 |
 | `src/tools/tool/index.ts` | `standardTools` 11 件套（opencode 同名集）：bash/edit/glob/grep/question/read/skill/task/todowrite/webfetch/write |
 | `src/tools/tool/bash.ts` | 权限最重的工具：拆段逐条 `ensureCommand` + **`gateTouchedPaths` 绕行硬闸**（命中已 deny 的 edit 目标直接抛错，防 deny 被 bash 洗掉）；win32 用 taskkill /T 杀树；接 `context.signal`（Ctrl+C 杀进程树）；`background:true`/尾随 `&` → detached 起后台，日志 `~/.ICEFOX-code/jobs/` + 退出码 sentinel，模型用 read 跟进。输出不再内部截断（交统一层） |
@@ -58,7 +60,8 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 | 文件 | 职责 |
 |---|---|
 | `src/permissionManager.ts` | 三把闸：`ensurePathAccess`（workspace 内直放）/ `ensureCommand`（先 cwd 后命令，`classifyDangerousCommand` 硬归类）/ `ensureEdit`（7 选项含 turn 级 allow_turn/allow_all_turn）。持久层 `~/.ICEFOX-code/permissions.json` 六组前缀/模式数组；内存层 session deny 集合（不持久）。`beginTurn/endTurn` 清 turn 级授权；文件整体 2 空格缩进异常 |
-| `src/permissionUi.ts` | 审批卡文案，走 `tty-prompt.readLine` 单读者 |
+| `src/permissionUi.ts` | 审批卡 → picker 的薄适配：choices 映射为选项、details 进 detail（Ctrl+O 可展），取消=deny_once（fail-closed）；deny_with_feedback 回落 `readLine` 收文本 |
+| `src/picker.ts` | 决策模态选择器（B3 L1）：↑↓/j/k 导航、1-9 与 option.key 单键直达、Enter 确认、Esc=取消、Ctrl+O 展开 detail。**全程走 onKey + settle 微任务拆栈**——Enter 伴生的 line 在"栈顶不接线"时被丢弃，单键漏进 buffer 的字符被 flushTypedInput 清理，结构性防抢答；`setPickerWriter` 供测试注入静默 sink（别猴补 process.stdout，会吞测试报告器） |
 
 ### 持久化与数据
 | 文件 | 职责 |
@@ -67,7 +70,7 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 | `src/context-tracer.ts` | 每次 `model.next()` 前写完整请求（system/messages/tools 全文）到 `~/.ICEFOX-code/traces/*.jsonl`，默认开 |
 | `src/inspect-trace.ts` / `src/dump-context.ts` | trace 离线查看器 / 首轮上下文固定开销一次性打印脚本 |
 | `src/utils/tool-result.ts` | 双层预算：单条 50k 替换 + 每批 200k 总量按大小降序替换；`EXEMPT_RESULT_TOOLS={skill,edit}` 豁免；全文落 `~/.ICEFOX-code/tool-results/<随机进程id>/<toolUseId>.txt`，替换文本含 preview+续读提示；`ContentReplacementState` 按 toolUseId 记忆替换文本实现**跨请求字节级稳定复放**；`pruneToolResults()` 7 天 TTL（启动调用） |
-| `src/utils/token-estimator.ts` | token 感知唯一出口：分角色字符率、**锚点+增量**计数（新鲜 `providerUsage.inputTokens` 起锚，尾段才字符估）、model→`effectiveInput` 窗口表、`markUsagesStale`；compact 触发与四档 warningLevel 都消费它 |
+| `src/utils/token-estimator.ts` | token 感知唯一出口：分角色字符率、**锚点+增量**计数（新鲜 `providerUsage.inputTokens` 起锚，尾段才字符估）、`markUsagesStale`；窗口来源二层——启动时 `hydrateModelContextWindow(model,{baseUrl,apiKey,modelsUrl})` 向 provider `/models` 要真实 `context_window`/`max_output_tokens` 写进进程缓存（候选地址链：MODELS_URL→base/models→去后缀→origin），`getModelContextWindow` 同步读缓存、**未命中一律回退 1M 兜底**（不再有离线模型表，启动日志明说"回退 1M"）；`formatTokens`（/1000 四舍五入，<1M 用 K、≥1M 用 M）供状态行统一展示；compact 触发与四档 warningLevel 都消费它 |
 | `src/environment.ts` | 进程/项目环境块（shell 探测、git root、slug）。B0 已摘除 trust 装饰（trustProject/trusted 字段/环境块宣称均已删） |
 | `src/workspace.ts` | `resolveToolPath` 路径闸唯一入口：有 permissions 委托之，无则越界即抛 |
 | `src/file-review.ts` | `buildUnifiedDiff`（diff 包）+ `applyReviewedFileChange`（write 的完整审批-写流程） |
@@ -75,8 +78,8 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 ### MCP 与交互
 | 文件 | 职责 |
 |---|---|
-| `src/mcp.ts` | **官方 SDK 版（v2）**：Client + Stdio/StreamableHTTP transport、分页 list、sanitize 命名 `mcp__server__tool` + description 头部 "MCP tool from server" 隐式标注、`onclose` 断线摘僵尸、`ToolListChanged` 热更新、结果归一化（content+structuredContent+isError→ok）。工具动态进同一 registry，与内置工具同管线 |
-| `src/tty-prompt.ts` | 单读者模型：`attachInputSource` 唯一订阅 rl.line；queue+waiters FIFO，EOF→全部 null。REPL/question/审批共用一条输入通道 | |
+| `src/mcp.ts` | **官方 SDK 版（v2）**：Client + Stdio/StreamableHTTP transport、分页 list、sanitize 命名 `mcp__server__tool` + description 头部 "MCP tool from server" 隐式标注、`onclose` 断线摘僵尸、`ToolListChanged` 热更新、结果归一化（content+structuredContent+isError→ok）、`enabled:false` 落 disabled 态、运行时 `reconnectMcpServer`/`disconnectMcpServer`（配置缓存在 configMap）。工具动态进同一 registry，与内置工具同管线 |
+| `src/tty-prompt.ts` | 单读者模型（B3 L1）：`attachInputSource` 唯一订阅 rl.line；queue+waiters FIFO，EOF→全部 null。**模态栈路由**：`pushModal({onKey,onLine,onClose})`——栈非空时 keypress 只给栈顶、line 交栈顶 onLine（无 onLine 则丢弃=结构性防抢答）；`interruptWaiters`/EOF 先关模态再 null 唤醒等待者；`flushTypedInput` 清模态消费后漏进 readline 缓冲的残字。**全局键表**：`onGlobalKey`（无模态时收 keypress，供 Ctrl+G/Ctrl+L 类空闲快捷键）+ `deliverLine`（模态把结果注入回等待中的 readLine）。未迁移消费方（question 多选等仍用 readLine）行为不变 |
 
 ## 3. 主流程速写
 
@@ -108,7 +111,7 @@ step:  model.next → assistant? return（回合完）
 - 同一 tool_result 三处阈值不一致：实时 50k/200k，resume 投影 25k 且形态变 `[tool X result]` 文本——resume 前后模型看到的不是同一份字节
 - `ToolRegistry` 类（tool.ts）与 `tools/index.ts` 的 Map registry 并存，**实际用后者**；`getStandardToolSchemas` 与 `getToolSchemas` 功能重复
 - abort 只保证「不留孤儿 tool_use + 收据正确」：长跑但不接 `context.signal` 的工具（edit 审批除外，它走 interruptWaiters）取消后仍会跑完当前那一次，只是结果丢弃
-- ESC 取消未做（需 raw mode），当前只有 Ctrl+C；`onThinking` 预览截断是 UI 行为，盘上 thinking 仍全量
+- ESC 在 picker 模态内=取消该卡；但**回合级取消仍只有 Ctrl+C**（空闲捕获 ESC 需自绘输入行，暂缓）；`onThinking` 预览截断是 UI 行为，盘上 thinking 仍全量
 - `/mcp connect/disconnect` 是运行时开关，但**改 mcp.json 仍要重启**（文件 watcher 没做）
 
 （B0 已清：trust 装饰、遗留工具文件、空文件、`check-deps` 坏脚本均已移除；`resumeMessages` chunkId 已实现为投影截断段）
@@ -116,4 +119,4 @@ step:  model.next → assistant? return（回合完）
 
 ## 6. 测试与验证现状
 
-`pnpm check`（tsc noEmit）+ `pnpm test`（node:test 经 tsx，`test/agent-loop.test.ts` 五用例：收据合约 / loop-guard / 预算稳定复放 / abort×2；测试自行把 `ICEFOX_CODE_HOME` 指到临时目录）。另有冒烟手段：`npx tsx smoke-mcp.ts`（MCP 连通）、`dump-context.ts`（首轮固定开销）、`inspect-trace.ts`（回放真实请求）。**动 agentloop/session 前先看 trace**——那里埋着本项目最贵的两个历史 bug（双提交点、引用共享）。
+`pnpm check`（tsc noEmit）+ `pnpm test`（node:test 经 tsx，五个文件 29 用例：`agent-loop`[收据/loop-guard/预算复放/abort×2] `tty-modal`[模态栈路由] `picker`[选择器+Enter 竞态] `keypress-wiring`[真 readline 伪 TTY 锁 keypress 监听对象] `token-estimator`[1M 兜底/formatTokens/远端缓存优先]；测试自行把 `ICEFOX_CODE_HOME` 指到临时目录）。另有冒烟手段：`npx tsx smoke-mcp.ts`（MCP 连通）、`dump-context.ts`（首轮固定开销）、`inspect-trace.ts`（回放真实请求）。**动 agentloop/session 前先看 trace**——那里埋着本项目最贵的两个历史 bug（双提交点、引用共享）。

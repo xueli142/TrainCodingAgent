@@ -10,7 +10,7 @@ import { agentloop } from './agent_loop.js'
 import { AnthropicModelAdapter } from './anthropic-adapter.js'
 import type { ChatMessage } from './type.js'
 import { enableTrace, flushTrace } from './context-tracer.js'
-import{MODEL, loadMcpConfig, ICEFOX_CODE_DIR}from './config.js'
+import{MODEL, API_KEY, BASE_URL, loadMcpConfig, ICEFOX_CODE_DIR}from './config.js'
 import { createContentReplacementState, pruneToolResults } from './utils/tool-result.js'
 import { discoverSkills, formatSkillsForPrompt } from './tools/tool/index.js'
 
@@ -38,12 +38,43 @@ setDefaultResultOrder('ipv4first')
 
 initRegistry()
 import { setQuestionHandler } from './tools/tool/index.js'
-import { readLine,attachInputSource, discardQueuedInput, interruptWaiters } from './tty-prompt.js'
+import { readLine,attachInputSource, discardQueuedInput, interruptWaiters, onGlobalKey, deliverLine } from './tty-prompt.js'
+import { pick as pickFromList } from './picker.js'
+import { computeContextStats, formatTokens, getModelContextWindow, hydrateModelContextWindow } from './utils/token-estimator.js'
 import { connectMcpServers, disconnectMcpServer, disposeMcp, getMcpStatus, reconnectMcpServer } from './mcp.js'
+
+const SLASH_COMMANDS = ['/exit', '/clear', '/sessions', '/rename', '/resume', '/compact', '/mcp', '/delete', '/model', '/init', '/help']
+
+function slashCompleter(line: string): [string[], string] {
+  if (!line.startsWith('/')) return [[], line]
+  const head = line.split(/\s/)[0] ?? line
+  const hits = SLASH_COMMANDS.filter(c => c.startsWith(head))
+  return [hits.map(h => `${h} `), head]
+}
 
 setQuestionHandler(async (questions) => {
   const answers: string[] = []
   for (const q of questions) {
+    if (q.options.length > 0 && !q.multiple) {
+      // 单选走 picker 模态；"自定义文本"是最后一项，选中后回落到行输入
+      const index = await pickFromList({
+        title: `[${q.header}] ${q.question}`,
+        options: [
+          ...q.options.map(o => ({ label: o.label, hint: o.description })),
+          { key: 't', label: '自定义文本…' },
+        ],
+        footer: '↑/↓ select · Enter confirm · Esc cancel',
+      })
+      if (index === null) throw new Error('No interactive console available') // question.ts 捕获 → ok:false 引导模型改纯文本提问
+      if (index < q.options.length) {
+        answers.push(q.options[index].label)
+        continue
+      }
+      const free = (await readLine('your answer> '))?.trim()
+      answers.push(free || '(no answer)')
+      continue
+    }
+    // 多选/无选项：保留行输入路径
     const dropped = discardQueuedInput()
     if (dropped > 0) {
       console.log(`[question] 已丢弃排队的 ${dropped} 行输入（防止抢答），需要请重新输入`)
@@ -53,7 +84,7 @@ setQuestionHandler(async (questions) => {
       console.log(`  ${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`))
     const tip = q.multiple ? '输入编号(逗号分隔)或自述，回车确认: ' : '输入编号或自述: '
     const line = await readLine(tip)
-    if (line === null) throw new Error('No interactive console available') // question.ts 会捕获 → ok:false 引导模型改纯文本提问
+    if (line === null) throw new Error('No interactive console available')
     const raw = line.trim()
     if (!q.multiple) {
       // 单选：仅当整行是合法编号才映射成选项，否则整行原样作为自由文本（避免带空格的回答被切碎）
@@ -136,6 +167,19 @@ async function main(): Promise<void> {
 
   const model = new AnthropicModelAdapter(getToolSchemas())
 
+  // 真实窗口：向 provider 的模型列表接口问一次（不再只靠内置表）；失败静默回退，不阻塞启动
+  const modelWindow = await hydrateModelContextWindow(MODEL, {
+    baseUrl: BASE_URL,
+    apiKey: API_KEY,
+    modelsUrl: process.env.MODELS_URL,
+    timeoutMs: 5_000,
+  }).catch(() => undefined)
+  console.log(
+    modelWindow
+      ? `\u001b[2m[model] ${MODEL} 窗口 ${formatTokens(modelWindow.contextWindow)} · 输入预算 ${formatTokens(modelWindow.effectiveInput)}（来自 /models）\u001b[0m`
+      : `\u001b[2m[model] 未能从接口获取 ${MODEL} 的真实窗口，回退 1M 兜底\u001b[0m`,
+  )
+
   async function systemContent(): Promise<string> {
     return buildSystemPrompt(
       cwd,
@@ -164,6 +208,7 @@ async function main(): Promise<void> {
     output: process.stdout,
     history: inputHistory,
     historySize: 200,
+    completer: slashCompleter,
   })
   attachInputSource(rl)
 
@@ -192,6 +237,49 @@ async function main(): Promise<void> {
     void flushOnExit().finally(() => process.exit(143))
   })
 
+  // ── 状态行（第 3 步）：prompt 前重算，回合中每 step 追加一行 ──
+  // 进度条粒度：每格 2 万 token；格数随窗口自适应（1M 窗口 ≈ 53 格）
+  const STATUS_TOKENS_PER_CELL = 20_000
+  function statusLine(): string {
+    const stats = computeContextStats(messages, MODEL)
+    // 展示口径：分母用完整上下文窗口（"最大的端"），直观反映当前上下文占用百分比
+    const contextWindow = getModelContextWindow(MODEL).contextWindow
+    const cells = Math.max(1, Math.ceil(contextWindow / STATUS_TOKENS_PER_CELL))
+    const ratio = Math.min(1, stats.totalTokens / contextWindow)
+    const filled = Math.round(ratio * cells)
+    const bar = '▓'.repeat(filled) + '░'.repeat(cells - filled)
+    const statuses = getMcpStatus()
+    const ready = statuses.filter(s => s.status === 'connected').length
+    const approx = stats.source === 'estimate_only' ? '~' : ''
+    const pct = Math.round(ratio * 100)
+    return `\u001b[2m[${sessionId.slice(0, 8)}] ${MODEL} · 已消耗 ${approx}${formatTokens(stats.totalTokens)}  ${bar} ${pct}% / ${formatTokens(contextWindow)}  · mcp ${ready}/${statuses.length}\u001b[0m`
+  }
+
+  // ── 空闲快捷键（第 2 步）：Ctrl+G 会话选择器 / Ctrl+L 状态行重绘；回合进行中一律放行 ──
+  onGlobalKey((_str, key) => {
+    if (activeTurn) return false
+    if (key.ctrl && key.name === 'g') {
+      void (async () => {
+        const sessions = await listSessions(cwd)
+        if (sessions.length === 0) {
+          console.log('No saved sessions.')
+          return
+        }
+        const index = await pickFromList({
+          title: 'Resume session',
+          options: sessions.map(s => ({ label: s.title ?? s.id, hint: `${s.id} · ${new Date(s.updatedAt).toLocaleString()}` })),
+        })
+        if (index !== null) deliverLine(`/resume ${sessions[index].id}`)
+      })()
+      return true
+    }
+    if (key.ctrl && key.name === 'l') {
+      process.stdout.write(`${statusLine()}\n`)
+      return true
+    }
+    return false
+  })
+
   let sessionId = newSessionId()
   let restored: ChatMessage[] = []
   const resumeArg = flagValue('--resume')
@@ -203,8 +291,8 @@ async function main(): Promise<void> {
     } else if (sessions.length > 0) {
       console.log('\nsessions:')
       sessions.forEach((s, i) => console.log(`  ${i + 1}. ${s.id}  ${new Date(s.updatedAt).toLocaleString()}  ${s.title ?? ''}`))
-      const pick = (await readLine('输入序号或 id 前缀（回车取最新）: '))?.trim()
-      target = !pick ? sessions[0]?.id : resolveSessionId(sessions, pick)
+      const chosenLine = (await readLine('输入序号或 id 前缀（回车取最新）: '))?.trim()
+      target = !chosenLine ? sessions[0]?.id : resolveSessionId(sessions, chosenLine)
     }
     if (!target) {
       console.error('No saved session to resume.')
@@ -304,7 +392,7 @@ async function main(): Promise<void> {
 
   try {
     while (true) {
-      const raw = await readLine()
+      const raw = await readLine(`${statusLine()}\n> `)
       if (raw === null) {
         break // EOF（Ctrl+D / 管道关闭）：退出循环，走 flushOnExit
       }
@@ -417,6 +505,16 @@ async function main(): Promise<void> {
         console.log('（占位）/model 尚未实现')
         continue
       }
+      if (input === '/status') {
+        console.log(statusLine())
+        const stats = computeContextStats(messages, MODEL)
+        console.log(`  tokens ${formatTokens(stats.totalTokens)}/${formatTokens(stats.effectiveInput)} (source=${stats.source}, level=${stats.warningLevel})`)
+        const contextWindow = getModelContextWindow(MODEL).contextWindow
+        console.log(`  窗口占用 ${Math.round(stats.totalTokens / contextWindow * 100)}% of ${formatTokens(contextWindow)}（输入预算 ${formatTokens(stats.effectiveInput)}，压缩阈值 85%）`)
+        console.log(`  messages=${messages.length}  session=${sessionId}`)
+        for (const s of getMcpStatus()) console.log(`  mcp ${s.name}: ${s.status} (${s.toolCount}${s.error ? ` ${s.error}` : ''})`)
+        continue
+      }
       if (input === '/help') {
         console.log([
           '/exit              退出（空闲时 Ctrl+C / Ctrl+D 亦可；回合中 Ctrl+C 只取消回合）',
@@ -428,6 +526,7 @@ async function main(): Promise<void> {
           '/compact           手动压缩上下文（micro 优先，必要时 summary）',
           '/delete /model /init  占位，尚未实现',
           'Ctrl+C             回合中=取消当前回合；空闲=退出',
+          'Ctrl+G             会话选择器    Ctrl+L 状态行重绘    Tab slash 补全',
         ].join('\n'))
         continue
       }
@@ -476,6 +575,7 @@ async function main(): Promise<void> {
           },
           onTurnDiags: info => {
             void appendSessionEvent(cwd, sessionId, 'turn_end', { ...info }).catch(() => {})
+            if (info.kind === 'tools') process.stdout.write(`${statusLine()}\n`)
           },
         })
         if (receipt.kind === 'aborted') {
