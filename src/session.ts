@@ -5,11 +5,10 @@ import { ICEFOX_CODE_DIR } from './config.js'
 import { projectSlug } from './environment.js'
 import type { ChatMessage } from './type.js'
 
-type SessionIndex={
-  lastSeq:number,
-  lastParetId:string|null,
-  saveIds:Set<string>
-
+export type SessionIndex = {
+  lastSeq: number              // 最后一个事件的 seq
+  lastParentId: string | null  // 最后一个事件的 id
+  savedIds: Set<string>        // 已落盘的 message.id
 }
 /**
  * 会话事件存储（event-sourced，参照 MiniCode/opencode 裁剪）：
@@ -61,7 +60,8 @@ export type SessionMeta = {
 
 /** 列表页展示用的标题上限；超出截断，避免一行 JSON 里塞进整段用户输入 */
 const MAX_TITLE_LENGTH = 60
-
+const indexes = new Map<string, SessionIndex>()
+// key = `${cwd}\u0000${sessionId}`（和 jobKey 一样的 NUL 分隔，避免冲突）
 function projectDirName(cwd: string): string {
   return projectSlug(cwd)
 }
@@ -83,6 +83,30 @@ export function newSessionId(): string {
   return randomUUID().slice(0, 8)
 }
 
+async function buildIndex(cwd: string, sessionId: string): Promise<SessionIndex> {
+  const events = await readEvents(cwd, sessionId)   // 唯一一次全文读
+  const savedIds = new Set<string>()
+  for (const e of events) {
+    const id = e.message?.id
+    if (typeof id === 'string') savedIds.add(id)
+  }
+  const last = events.at(-1)
+  return {
+    lastSeq: last?.seq ?? -1,
+    lastParentId: last?.id ?? null,
+    savedIds,
+  }
+}
+
+async function getIndex(cwd: string, sessionId: string): Promise<SessionIndex> {
+  const key = jobKey(cwd, sessionId)
+  let idx = indexes.get(key)
+  if (!idx) {
+    idx = await buildIndex(cwd, sessionId)
+    indexes.set(key, idx)
+  }
+  return idx
+}
 /** ChatMessage 的 role 到事件类型的映射；不可持久化的 role 直接抛错，防止静默丢数据 */
 function roleToType(message: ChatMessage): SessionEventType {
   switch (message.role) {
@@ -222,38 +246,22 @@ export async function saveMessages(
   return withStoreLock(() => saveMessagesLocked(cwd, sessionId, messages))
 }
 
-async function saveMessagesLocked(
-  cwd: string,
-  sessionId: string,
-  messages: ChatMessage[],
-  
-): Promise<number> {
+async function saveMessagesLocked(cwd:string, sessionId:string, messages:ChatMessage[]) {
   const chunkId = randomUUID()
-  const existing = await readEvents(cwd, sessionId)
-  // 已落盘的消息 id 集合：用于过滤本次的新增部分
-  const savedMessageIds = new Set(
-    existing
-      .map(event => event.message?.id)
-      .filter((id): id is string => typeof id === 'string'),
-  )
+  const idx = await getIndex(cwd, sessionId)        // ← 缓存
 
-  // 从文件尾部续接事件链，保证 seq 单调、parent 指向正确
-  const last = existing.at(-1)
-  let parent = last?.id ?? null
-  let seq = (last?.seq ?? -1) + 1
-
-  const fresh: ChatMessage[] = []
+  let parent = idx.lastParentId
+  let seq = idx.lastSeq + 1
   const batchSeen = new Set<string>()
+  const fresh: ChatMessage[] = []
+
   for (const message of messages) {
     if (message.role === 'system' || message.role === 'tool') continue
-    if (message.id && (savedMessageIds.has(message.id) || batchSeen.has(message.id))) continue
+    if (message.id && (idx.savedIds.has(message.id) || batchSeen.has(message.id))) continue
     if (message.id) batchSeen.add(message.id)
     fresh.push(message)
   }
-
-  if (fresh.length === 0) {
-    return 0
-  }
+  if (fresh.length === 0) return 0
 
   const events: SessionEvent[] = []
   for (const message of fresh) {
@@ -261,20 +269,32 @@ async function saveMessagesLocked(
     const event: SessionEvent = {
       id: randomUUID(),
       session: sessionId,
-      chunkId:chunkId,
+      chunkId,
       seq: seq++,
       cwd,
       type: roleToType(message),
       ts: new Date().toISOString(),
       parent,
-      // 拷贝一份 message，避免外部后续修改数组元素影响已构造的事件
       message: { ...message, id: messageId },
     }
     parent = event.id
     events.push(event)
   }
 
-  await appendRawEvents(cwd, sessionId, events)
+  try {
+    await appendRawEvents(cwd, sessionId, events)
+  } catch (err) {
+    indexes.delete(jobKey(cwd, sessionId))          // 失败丢缓存
+    throw err
+  }
+
+  // 写成功后才更新缓存
+  for (const event of events) {
+    const id = event.message?.id
+    if (typeof id === 'string') idx.savedIds.add(id)
+  }
+  idx.lastSeq = seq - 1
+  idx.lastParentId = parent
   return events.length
 }
 
@@ -426,24 +446,28 @@ async function appendSessionEventLocked(
   data: Record<string, unknown>,
   extra?: { title?: string },
 ): Promise<SessionEvent> {
-  const existing = await readEvents(cwd, sessionId)
-  const last = existing.at(-1)
+      const idx = await getIndex(cwd, sessionId)             // 缓存，只首次重建
   const event: SessionEvent = {
     id: randomUUID(),
     session: sessionId,
-    chunkId:randomUUID(),
-    seq: (last?.seq ?? -1) + 1,
+    chunkId: randomUUID(),
+    seq: idx.lastSeq + 1,                                // ← 从 idx 算
     cwd,
-    
     type,
     ts: new Date().toISOString(),
-    parent: last?.id ?? null,
+    parent: idx.lastParentId,                            // ← 从 idx 算
     message: null,
-    // 只在确实有 title 时写入字段，避免 JSON 里出现无意义的 null
     ...(extra?.title !== undefined ? { title: extra.title } : {}),
     data,
   }
-  await appendRawEvents(cwd, sessionId, [event])
+  try {
+    await appendRawEvents(cwd, sessionId, [event])
+  } catch (err) {
+    indexes.delete(jobKey(cwd, sessionId))               // 失败丢缓存
+    throw err
+  }
+  idx.lastSeq = event.seq                                // 写成功后才更新
+  idx.lastParentId = event.id
   return event
 }
 
@@ -696,8 +720,10 @@ export async function clearSession(
   try {
     await unlink(sessionFilePath(cwd, sessionId))
   } catch {
+
     // already gone
   }
+  indexes.delete(jobKey(cwd,sessionId))
   try {
     const remaining = await readdir(projectDir(cwd))
     if (remaining.length === 0) {
