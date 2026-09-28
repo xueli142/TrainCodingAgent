@@ -1,9 +1,19 @@
 import path from 'node:path'
 import os from 'node:os'
 import 'dotenv/config'
-export const MODEL = process.env.MODEL as string
-export const API_KEY = process.env.API_KEY as string
- export const BASE_URL = process.env.BASE_URL as string
+// 不要 import 'dotenv/config'
+import { readFileSync } from 'node:fs'
+import { parse } from 'dotenv'
+
+const dotenvVars = (() => {
+  try { return parse(readFileSync(path.join(process.cwd(), '.env'))) }
+  catch { return {} }
+})()
+
+export const MODEL   = process.env.MODEL   ?? dotenvVars.MODEL
+export const API_KEY = process.env.API_KEY ?? dotenvVars.API_KEY
+export const BASE_URL = process.env.BASE_URL ?? dotenvVars.BASE_URL
+
 export type RuntimeConfig = {
   model: string
   baseUrl: string

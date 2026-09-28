@@ -62,6 +62,9 @@
 
 ## 归档 · 已完成（时间倒序，只留一句话）
 
+### 2026-09-29（index 拆分 · TUI Phase 0 地基）
+- [X] `src/index.ts` 610 行 → ~230 行薄装配根：拆出 `repl/{context,turn,slash,status,hotkeys}.ts` + `question-ui.ts`，`resolveSessionId`/`previewMessages` 收编进 `session.ts`；`ReplContext` 统一 sessionId/messages/activeTurn；纯搬迁无行为变化（check + 29 用例 + `--sessions` 冒烟过），TUI 升级时只换外壳、`runTurn`/`handleSlash` 直接复用
+
 ### 2026-09-28（窗口真值化收尾）
 - [X] 模型窗口强制查 `/models`（候选链 MODELS_URL→base/models→去后缀→origin），**删内置猜测表**，失败统一 1M 兜底并明说；`formatTokens`（/1000 四舍五入，<1M 用 K、≥1M 用 M）统一状态行与 /status
 - [X] keypress 监听对象修正（rl 不转发 keypress，须听 stdin 流本身）+ 真 readline 回归测试；`flushTypedInput` 单 key 对象修正；picker Enter 微任务拆栈防抢答

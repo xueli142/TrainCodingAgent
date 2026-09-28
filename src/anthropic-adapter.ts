@@ -222,7 +222,7 @@ export class AnthropicModelAdapter implements ModelAdapter {
       system: payload.system,
       messages: payload.messages,
       tools: this.tools,
-      max_tokens: 8192,
+      max_tokens: 28192,
       //extended thinking：THINKING_BUDGET=0 关闭；budget 必须小于 max_tokens
       ...(THINKING_BUDGET > 0
         ? { thinking: { type: 'enabled', budget_tokens: THINKING_BUDGET } }

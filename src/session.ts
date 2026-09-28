@@ -5,7 +5,12 @@ import { ICEFOX_CODE_DIR } from './config.js'
 import { projectSlug } from './environment.js'
 import type { ChatMessage } from './type.js'
 
+type SessionIndex={
+  lastSeq:number,
+  lastParetId:string|null,
+  saveIds:Set<string>
 
+}
 /**
  * 会话事件存储（event-sourced，参照 MiniCode/opencode 裁剪）：
  * - 事实源：~/.ICEFOX-code/projects/<cwd-slug>/<sessionId>.jsonl，一行一个 JSON 事件，append-only
@@ -651,6 +656,36 @@ export async function listSessions(cwd: string): Promise<SessionMeta[]> {
 export async function latestSessionId(cwd: string): Promise<string | null> {
   const sessions = await listSessions(cwd)
   return sessions[0]?.id ?? null
+}
+
+/** 会话目标解析：序号 | 完整 id | 唯一前缀 */
+export function resolveSessionId(
+  sessions: Array<{ id: string }>,
+  arg: string,
+): string | undefined {
+  if (/^\d+$/.test(arg)) {
+    return sessions[Number(arg) - 1]?.id
+  }
+  const exact = sessions.find(s => s.id === arg)
+  if (exact) {
+    return exact.id
+  }
+  const prefixHits = sessions.filter(s => s.id.startsWith(arg))
+  return prefixHits.length === 1 ? prefixHits[0]?.id : undefined
+}
+
+/** 会话末尾若干条消息的一行式预览（/resume 切换前后对照用） */
+export function previewMessages(messages: ChatMessage[], count = 4): string[] {  return messages
+    .filter(m => m.role !== 'system' && m.role !== 'tool')
+    .slice(-count)
+    .map(m => {
+      if (m.role === 'user') return `user: ${m.content.slice(0, 80)}`
+      if (m.role === 'assistant') return `assistant: ${m.content.slice(0, 80)}`
+      if (m.role === 'context_summary') return `summary: ${m.content.slice(0, 80)}...`
+      if (m.role === 'tool_result') return `tool(${m.toolName})${m.isError ? ' [error]' : ''}`
+      if (m.role === 'assistant_tool_call') return `call ${m.toolName}`
+      return m.role
+    })
 }
 
 /** 删除会话文件；项目目录空了就顺手清掉，避免留下空壳目录 */

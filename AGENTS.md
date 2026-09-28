@@ -23,7 +23,13 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 ### 入口与装配（composition root）
 | 文件 | 职责 |
 |---|---|
-| `src/index.ts` | REPL + 装配根。启动时序：`initRegistry()`(静态工具) → `discoverSkills` → `PermissionManager.whenReady` → **`connectMcpServers(loadMcpConfig(cwd))`** → `new AnthropicModelAdapter(getToolSchemas())`（⚠️ 工具在此快照，MCP 必须先注册）→ system/catalog 组装 → `resumeMessages` 恢复 → readline 循环。斜杠命令：`/exit /clear /sessions /rename /resume /compact /mcp /status /help` 已实现；`/delete /model /init` 是占位。**Ctrl+C 双语义**：回合中=取消当前回合（AbortController+interruptWaiters），空闲=退出。输入历史 `history.jsonl` 持久化 + ↑↓。**TUI 三件套（B3 L1）**：prompt 前置状态行（`statusLine()`：session/model/ctx 利用率/mcp 就绪数）+ Tab slash 补全（readline completer）+ 空闲全局键 Ctrl+G 会话选择器 / Ctrl+L 重绘；回合中每个 tools step 经 onTurnDiags 重打状态行 |
+| `src/index.ts` | **入口薄壳（~230 行，原 610 行已拆分）**。装配时序：`initRegistry()`(静态工具) → `installQuestionHandler` → `discoverSkills` → `PermissionManager.whenReady` → **`connectMcpServers(loadMcpConfig(cwd))`** → `new AnthropicModelAdapter(getToolSchemas())`（⚠️ 工具在此快照，MCP 必须先注册）→ 构造 `ReplContext` → readline + 输入历史 `history.jsonl`(↑↓) + `slashCompleter`(Tab) → **Ctrl+C 双语义**（回合中=取消当前回合 AbortController+interruptWaiters，空闲=退出）→ 启动 `--resume` → 主循环：`readLine(statusLine+提示符)` → `handleSlash` 分发或 `runTurn`；`--sessions` 只列不进 REPL |
+| `src/repl/context.ts` | `ReplContext` 共享状态容器（cwd/projectRoot/model/permissions/toolResultState/historyFile/sessionId/messages/activeTurn/systemContent）；注释写明**重绑=换会话、原地 splice=压缩**的引用纪律两分法 |
+| `src/repl/turn.ts` | `runTurn(ctx, input)`：登记 user → 双层 compact → `agentloop`（四回调输出）→ 收据保存；`captureContextSnapshot(ctx)`：启动/切会话固化 system+catalog+tools。这就是将来 TUI 直接复用的"回合 API" |
+| `src/repl/slash.ts` | `SLASH_COMMANDS` / `slashCompleter` / `handleSlash`→`'exit'｜'continue'｜'passthrough'`（未识别 `/xxx` 按普通输入进模型）。已实现 `/exit /clear /sessions /rename /resume /compact /mcp /status /help`；`/delete /model /init` 占位 |
+| `src/repl/status.ts` | `statusLine(ctx)`：session/model/ctx 利用率条(每格 2 万 token)/mcp 就绪数——prompt 前置、Ctrl+L、回合中每个 tools step 经 onTurnDiags 重打共用 |
+| `src/repl/hotkeys.ts` | 空闲全局键：Ctrl+G 会话选择器（picker→deliverLine）/ Ctrl+L 重绘；`ctx.activeTurn` 非空一律放行 |
+| `src/question-ui.ts` | question 工具 TTY 接线：单选=picker 模态+"自定义文本"回落行输入；多选=`discardQueuedInput` 防抢答后编号/自由文本 |
 | `bin/icefox.js` | 薄壳：`icefox start` → `pnpm start` |
 | `src/config.ts` | env 常量 + `ICEFOX_CODE_DIR` + `McpServerConfig` 类型（含 enabled）+ **`loadMcpConfig(cwd)`**：用户级 `~/.ICEFOX-code/mcp.json` 与项目级 `.icefox/mcp.json` 合并（支持 Cursor 的 `mcpServers` 包裹），内置 `DEFAULT_MCP_SERVERS` 兜底；`RuntimeConfig` 类型无人使用 |
 
@@ -66,7 +72,7 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 ### 持久化与数据
 | 文件 | 职责 |
 |---|---|
-| `src/session.ts` | **事实日志**：`~/.ICEFOX-code/projects/<slug>/<sessionId>.jsonl` append-only，13 种事件类型。写路径三层：`appendSessionEvent`（即时落盘）、`saveMessages`/`scheduleSave`（按 id 去重增量 + 1s 批量 + `withStoreLock` promise 链串行化保 seq 链）、`flushSessionSaves`（退出/切会话前）。读路径 `projectMessages`：**从最后一条 summary 起播**；thinking/progress/tool_call 不进上下文（tool_call 的 input 留盘审计）；tool_result 降维为 user 文本截 25k |
+| `src/session.ts` | **事实日志**：`~/.ICEFOX-code/projects/<slug>/<sessionId>.jsonl` append-only，13 种事件类型。写路径三层：`appendSessionEvent`（即时落盘）、`saveMessages`/`scheduleSave`（按 id 去重增量 + 1s 批量 + `withStoreLock` promise 链串行化保 seq 链）、`flushSessionSaves`（退出/切会话前）。读路径 `projectMessages`：**从最后一条 summary 起播**；thinking/progress/tool_call 不进上下文（tool_call 的 input 留盘审计）；tool_result 降维为 user 文本截 25k。`resolveSessionId`（序号/精确/唯一前缀）与 `previewMessages`（一行式预览）也在本模块，供 REPL 与启动 `--resume` 共用 |
 | `src/context-tracer.ts` | 每次 `model.next()` 前写完整请求（system/messages/tools 全文）到 `~/.ICEFOX-code/traces/*.jsonl`，默认开 |
 | `src/inspect-trace.ts` / `src/dump-context.ts` | trace 离线查看器 / 首轮上下文固定开销一次性打印脚本 |
 | `src/utils/tool-result.ts` | 双层预算：单条 50k 替换 + 每批 200k 总量按大小降序替换；`EXEMPT_RESULT_TOOLS={skill,edit}` 豁免；全文落 `~/.ICEFOX-code/tool-results/<随机进程id>/<toolUseId>.txt`，替换文本含 preview+续读提示；`ContentReplacementState` 按 toolUseId 记忆替换文本实现**跨请求字节级稳定复放**；`pruneToolResults()` 7 天 TTL（启动调用） |
