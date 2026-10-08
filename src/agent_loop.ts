@@ -53,16 +53,6 @@ async function executeTool(name: string, rawInput: unknown, context: ToolContent
   }
 }
 
-/**
- * 
- * 
- * 合约（收据版）：
- *  - 所有新消息【就地 push 进 args.messages】（共享数组）——回合中途调度器/压缩能看到真实进度
- *  - 返回值 = TurnReceipt（新增条数 + 结束类型 + usage），不回传消息本身——caller 回推在类型层已不可能
- *  - 完全相同的 (tool,input) 调用达 LOOP_GUARD_AFTER_REPEATS 次 → 注入 loop-guard 提示
- * 
- *  args权威定义了参数
- */
 export async function agentloop(args: {
   model: ModelAdapter
   messages: ChatMessage[]
@@ -76,6 +66,12 @@ export async function agentloop(args: {
   onProgressMessage?: (content: string) => void
   onThinking?: (content: string) => void
   onTurnDiags?: (info: TurnDiagInfo) => void
+  /** 每次 model.next() 前：UI 用来进入"等响应"状态 */
+  onModelStart?: (step: number) => void
+  /** 工具开始执行（abort 跳过的调用不会触发） */
+  onToolStart?: (info: { toolUseId: string; toolName: string; input: unknown; index: number; total: number }) => void
+  /** 工具执行完成；durationMs 只含 tool.run，不含排队 */
+  onToolResult?: (info: { toolUseId: string; toolName: string; ok: boolean; durationMs: number; index: number; total: number }) => void
 }): Promise<TurnReceipt> {
   const messages = args.messages
   const maxSteps = args.maxSteps ?? 30
@@ -127,6 +123,7 @@ export async function agentloop(args: {
       return endTurn(step, 'aborted')
     }
     let response: Awaited<ReturnType<ModelAdapter['next']>>
+    args.onModelStart?.(step)
     try {
       response = await args.model.next(messages, args.signal)
     } catch (error) {
@@ -201,7 +198,9 @@ export async function agentloop(args: {
     })))
 
     const toolResults: PendingToolResult[] = []
-    for (const call of response.calls) {
+    const callTotal = response.calls.length
+    for (let callIndex = 0; callIndex < callTotal; callIndex++) {
+      const call = response.calls[callIndex]
       //取消落地：本 step 内未执行的调用也必须配对回 tool_result，否则 tool_use 孤儿会炸下一次请求
       if (args.signal?.aborted) {
         toolResults.push({
@@ -217,10 +216,26 @@ export async function agentloop(args: {
       const count = (callCounts.get(key) ?? 0) + 1
       callCounts.set(key, count)
 
+      args.onToolStart?.({
+        toolUseId: call.id,
+        toolName: call.toolName,
+        input: call.input,
+        index: callIndex + 1,
+        total: callTotal,
+      })
+      const toolStartedAt = Date.now()
       const result = await executeTool(call.toolName, call.input, {
         cwd: args.cwd,
         permissions: args.permissions,
         signal: args.signal,
+      })
+      args.onToolResult?.({
+        toolUseId: call.id,
+        toolName: call.toolName,
+        ok: result.ok,
+        durationMs: Date.now() - toolStartedAt,
+        index: callIndex + 1,
+        total: callTotal,
       })
 
       let output = result.output

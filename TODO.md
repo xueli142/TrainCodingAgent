@@ -27,9 +27,11 @@
 
 - [ ] 多行 prompt（状态行+`> `）依赖 readline 兼容性，异常终端错位再评估自绘输入行
 - [ ] 心跳刷新等真上流式输出时一并设计
-- [ ] L2（冻结）：自绘全屏 raw mode + 行级 diff 重绘，教材 MiniCode `tty-app.ts`/`screen.ts:53-85`；先守"键击只写 input 缓冲、回调只写 transcript"的无锁纪律
+- [X] **L1.5 活区重绘（2026-10-08）**：回合内底部活区 = 工具卡片行（▸→✔/✖ 计时，行级差分只重写变化行，教材 MiniCode `screen.ts:53-85`）+ Thinking spinner + statusLine 常驻尾条；不进 alt-screen、不接管输入，readline/picker/question 照常。`--inline`/`ICEFOX_TUI=inline` 退化追加式；非 TTY 一律 inline（零 ANSI 零卡片）。接线：agentloop 新增 `onModelStart/onToolStart/onToolResult`；tty-prompt 新增 `onModalChange/onExternalWrite` 广播（弹卡前渲染器先落历史，杜绝错位回写）；实现见 `src/repl/ui-kit.ts`/`renderer.ts`/`live.ts`
+- [X] **Markdown 终端渲染（2026-10-08）**：assistant/progress/thinking 预览经 `renderTerminalMarkdown`——粗体/斜体/删除线/行内代码/标题/引用/分隔线/链接转 ANSI 或剥标记；围栏代码块内原样保护；只动显示，session/trace 存原文（`src/repl/md.ts`）
+- [ ] L3（仍冻结）：自绘全屏 raw mode + 自绘输入行 + 鼠标，教材 MiniCode `tty-app.ts`；`TurnRenderer` 接口即插座，升级只加实现不动内核——先守"键击只写 input 缓冲、回调只写 transcript"的无锁纪律
 - [ ] ❌ 永不做：Ink/OpenTUI（React 依赖与"极简可通读"冲突）
-- [ ] 纪律：**UI 只订阅 `onAssistantMessage`/`onProgressMessage`/`onThinking`/`onTurnDiags` 事件流**，不读 agentloop 内部状态——事件流即投影源，L2 时只搬 REPL，主循环不动
+- [ ] 纪律：**UI 只订阅 `onModelStart`/`onAssistantMessage`/`onProgressMessage`/`onThinking`/`onToolStart`/`onToolResult`/`onTurnDiags` 事件流**，不读 agentloop 内部状态——事件流即投影源，升级渲染只换 renderer 不动主循环
 
 ### B4 · plan 与 goal（下一个动工）
 

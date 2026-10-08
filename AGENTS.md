@@ -23,11 +23,15 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 ### 入口与装配（composition root）
 | 文件 | 职责 |
 |---|---|
-| `src/index.ts` | **入口薄壳（~230 行，原 610 行已拆分）**。装配时序：`initRegistry()`(静态工具) → `installQuestionHandler` → `discoverSkills` → `PermissionManager.whenReady` → **`connectMcpServers(loadMcpConfig(cwd))`** → `new AnthropicModelAdapter(getToolSchemas())`（⚠️ 工具在此快照，MCP 必须先注册）→ 构造 `ReplContext` → readline + 输入历史 `history.jsonl`(↑↓) + `slashCompleter`(Tab) → **Ctrl+C 双语义**（回合中=取消当前回合 AbortController+interruptWaiters，空闲=退出）→ 启动 `--resume` → 主循环：`readLine(statusLine+提示符)` → `handleSlash` 分发或 `runTurn`；`--sessions` 只列不进 REPL |
+| `src/index.ts` | **入口薄壳（~230 行，原 610 行已拆分）**。装配时序：`initRegistry()`(静态工具) → `installQuestionHandler` → `discoverSkills` → `PermissionManager.whenReady` → **`connectMcpServers(loadMcpConfig(cwd))`** → `new AnthropicModelAdapter(getToolSchemas())`（⚠️ 工具在此快照，MCP 必须先注册）→ 构造 `ReplContext` → readline + 输入历史 `history.jsonl`(↑↓) + `slashCompleter`(Tab) → **Ctrl+C 双语义**（回合中=取消当前回合 AbortController+interruptWaiters+abortActiveTurnRenderer，空闲=退出）→ 启动 `--resume`；`--inline`/`ICEFOX_TUI=inline` 选追加式渲染，默认 live 活区（非 TTY 自动退化） → 主循环：`readLine(statusLine+提示符)` → `handleSlash` 分发或 `runTurn`；`--sessions` 只列不进 REPL |
 | `src/repl/context.ts` | `ReplContext` 共享状态容器（cwd/projectRoot/model/permissions/toolResultState/historyFile/sessionId/messages/activeTurn/systemContent）；注释写明**重绑=换会话、原地 splice=压缩**的引用纪律两分法 |
-| `src/repl/turn.ts` | `runTurn(ctx, input)`：登记 user → 双层 compact → `agentloop`（四回调输出）→ 收据保存；`captureContextSnapshot(ctx)`：启动/切会话固化 system+catalog+tools。这就是将来 TUI 直接复用的"回合 API" |
+| `src/repl/turn.ts` | `runTurn(ctx, input)`：登记 user → 双层 compact → 建回合 renderer（订阅 `onModalChange/onExternalWrite`，弹卡前落历史）→ `agentloop`（全回调接 renderer 输出）→ 收据保存 + `ui.finish`；`captureContextSnapshot(ctx)`：启动/切会话固化 system+catalog+tools。这就是将来 TUI 直接复用的"回合 API" |
+| `src/repl/ui-kit.ts` | 渲染公共件（B3 L1.5）：`TurnRenderer`/`ToolStart/ResultInfo` 类型层、颜色板、CJK 感知 `displayWidth/truncateToWidth`、`summarizeToolInput`（bash→command、read/edit/write→filePath、grep→pattern@path、其余 JSON 兜底截断）、**`LineCanvas`**（transient 块所有权：首帧纯 append；再 paint 上移+逐行差分只重写变化行；`append` 先落历史再写；`commit` 放手；非 TTY paint 退化纯 append 零回写） |
+| `src/repl/renderer.ts` | 回合渲染器工厂 + inline 实现（路线 A）：`createTurnRenderer(deps)` 全部环境交互可注入（write/isTTY/statusLine/setTimer/onResize/now）；inline=追加式 + 单行 transient（Thinking… 120ms 转圈、工具 ▸ 被 ✔/✖ 原地改写，弹卡后改追加）；非 TTY/`TERM=dumb`/`NO_COLOR` 一律退化（无 spinner 无卡片无 ANSI）。`setTuiMode('inline'|'live')`、`abortActiveTurnRenderer()`（Ctrl+C 先静默收尾）、`disposeActiveTurnRenderer()` |
+| `src/repl/live.ts` | 活区渲染器（路线 B-lite）：底部帧 = 工具卡片行（▸…Ns → ✔ Ns，同批各占一行，批内 `(i/n)`）+ Thinking 计时 + statusLine 常驻尾条；进模型 step 重新起块。所有权纪律：`commitForModal` 后本批转 append-only，杜绝光标回写撞上审批卡/question 画的行。不进 alt-screen 不接管输入，readline/picker/question 全部照常 |
+| `src/repl/md.ts` | Markdown 终端渲染（B3 配套，`renderTerminalMarkdown(text, palette)`）：行级=围栏代码块原样保护/围栏行置灰、`#` 标题剥标记加粗、`---` 转分隔线、`>` 引用转 `│ ` 置灰；行内=代码青色、粗体/斜体/删除线转 ANSI、链接拆 `文本(url)`。只动显示——session/trace 存原文；恒等调色板（非 TTY/NO_COLOR）剥标记不落 ANSI，管道拿到干净文本。表格/列表结构原样保留 |
 | `src/repl/slash.ts` | `SLASH_COMMANDS` / `slashCompleter` / `handleSlash`→`'exit'｜'continue'｜'passthrough'`（未识别 `/xxx` 按普通输入进模型）。已实现 `/exit /clear /sessions /rename /resume /compact /mcp /status /help`；`/delete /model /init` 占位 |
-| `src/repl/status.ts` | `statusLine(ctx)`：session/model/ctx 利用率条(每格 2 万 token)/mcp 就绪数——prompt 前置、Ctrl+L、回合中每个 tools step 经 onTurnDiags 重打共用 |
+| `src/repl/status.ts` | `statusLine(ctx)`：session/model/ctx 利用率条(每格 2 万 token)/mcp 就绪数——prompt 前置、Ctrl+L、live 模式回合内作活区尾条常驻（onTurnDiags 重打已由渲染器 footer 取代） |
 | `src/repl/hotkeys.ts` | 空闲全局键：Ctrl+G 会话选择器（picker→deliverLine）/ Ctrl+L 重绘；`ctx.activeTurn` 非空一律放行 |
 | `src/question-ui.ts` | question 工具 TTY 接线：单选=picker 模态+"自定义文本"回落行输入；多选=`discardQueuedInput` 防抢答后编号/自由文本 |
 | `bin/icefox.js` | 薄壳：`icefox start` → `pnpm start` |
@@ -36,7 +40,7 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 ### Agent 内核
 | 文件 | 职责 |
 |---|---|
-| `src/agent_loop.ts` | 回合内核。每 step 调 `model.next()` 后只有三条出路：`assistant` → append + **return 结束回合**；`tool_calls` → 逐个 `executeTool`（registry 查名 → zod safeParse → run → catch 转 ok:false）→ loop-guard（同调用第 10 次注入警告）→ 结果过双层预算 → 下一 step；空响应 → 有 progress 文本则续跑否则 return。30 步上限。返回 `TurnReceipt`（addedCount+kind+usage/stopReason），消息只就地 push。接受 `signal`（AbortSignal）：取消时批内未执行调用补配对 cancelled 结果，`kind:'aborted'` 收尾。**权限不在这里**（塞进 `ToolContent.permissions` 由工具自查）；输出全走回调，不碰 UI/落盘 |
+| `src/agent_loop.ts` | 回合内核。每 step 调 `model.next()` 后只有三条出路：`assistant` → append + **return 结束回合**；`tool_calls` → 逐个 `executeTool`（前后发 `onToolStart/onToolResult` 回调，abort 跳过的调用不发；step 调 `model.next()` 前发 `onModelStart`；registry 查名 → zod safeParse → run → catch 转 ok:false）→ loop-guard（同调用第 10 次注入警告）→ 结果过双层预算 → 下一 step；空响应 → 有 progress 文本则续跑否则 return。30 步上限。返回 `TurnReceipt`（addedCount+kind+usage/stopReason），消息只就地 push。接受 `signal`（AbortSignal）：取消时批内未执行调用补配对 cancelled 结果，`kind:'aborted'` 收尾。**权限不在这里**（塞进 `ToolContent.permissions` 由工具自查）；输出全走回调，不碰 UI/落盘 |
 | `src/compact.ts` | 压缩两层：`maybeCompactContext` 先 micro（利用率过半，旧 tool_result 就地清 `[cleared]`，盘上不动）后 auto（≥85%×effectiveInput 中段 summarize）；`force` 支持手动 `/compact`；summary 落成后 `markUsagesStale` 整批标脏 |
 | `src/type.ts` | `ChatMessage` 12 角色联合类型（含 `assistant_thinking` 带 signature 块、`context_summary`、`snip_boundary`）；`AgentStep`（assistant \| tool_calls，usage 现在会挂到消息的 `providerUsage` 上） |
 | `src/prompt.ts` | `buildSystemPrompt`：身份行 + 环境块 + cwd + 行为准则 + **denial 硬停条款（禁 bash 绕行）** + 权限摘要 + skills 目录块 |
@@ -85,26 +89,29 @@ npx tsx smoke-mcp.ts       # MCP 连通性冒烟（server-everything 当靶子�
 | 文件 | 职责 |
 |---|---|
 | `src/mcp.ts` | **官方 SDK 版（v2）**：Client + Stdio/StreamableHTTP transport、分页 list、sanitize 命名 `mcp__server__tool` + description 头部 "MCP tool from server" 隐式标注、`onclose` 断线摘僵尸、`ToolListChanged` 热更新、结果归一化（content+structuredContent+isError→ok）、`enabled:false` 落 disabled 态、运行时 `reconnectMcpServer`/`disconnectMcpServer`（配置缓存在 configMap）。工具动态进同一 registry，与内置工具同管线 |
-| `src/tty-prompt.ts` | 单读者模型（B3 L1）：`attachInputSource` 唯一订阅 rl.line；queue+waiters FIFO，EOF→全部 null。**模态栈路由**：`pushModal({onKey,onLine,onClose})`——栈非空时 keypress 只给栈顶、line 交栈顶 onLine（无 onLine 则丢弃=结构性防抢答）；`interruptWaiters`/EOF 先关模态再 null 唤醒等待者；`flushTypedInput` 清模态消费后漏进 readline 缓冲的残字。**全局键表**：`onGlobalKey`（无模态时收 keypress，供 Ctrl+G/Ctrl+L 类空闲快捷键）+ `deliverLine`（模态把结果注入回等待中的 readLine）。未迁移消费方（question 多选等仍用 readLine）行为不变 |
+| `src/tty-prompt.ts` | 单读者模型（B3 L1）：`attachInputSource` 唯一订阅 rl.line；queue+waiters FIFO，EOF→全部 null。**模态栈路由**：`pushModal({onKey,onLine,onClose})`——栈非空时 keypress 只给栈顶、line 交栈顶 onLine（无 onLine 则丢弃=结构性防抢答）；`interruptWaiters`/EOF 先关模态再 null 唤醒等待者；`flushTypedInput` 清模态消费后漏进 readline 缓冲的残字。**全局键表**：`onGlobalKey`（无模态时收 keypress，供 Ctrl+G/Ctrl+L 类空闲快捷键）+ `deliverLine`（模态把结果注入回等待中的 readLine）。未迁移消费方（question 多选等仍用 readLine）行为不变。**渲染协调广播（B3 L1.5）**：`onModalChange(listener)` 在 pushModal/closeModal 广播新深度；`onExternalWrite(listener)` 在 `readLine(prompt)` 写提示符前广播——回合渲染器借此先把 transient/活区落成历史再让外部输出进场，杜绝光标回写撞行 |
 
 ## 3. 主流程速写
 
 ```
 启动:  initRegistry → skills → permissions(whenReady) → connectMcpServers(注册进registry)
        → new AnthropicModelAdapter(getToolSchemas() 快照) → messages=[system, catalog, ...resume投影]
-每轮:  user 输入(+history) → push+scheduleSave → maybeCompactContext(micro:util≥50% 清旧 tool_result；
-       auto:util≥85%×effectiveInput 中段 summarize) → beginTurn+AbortController → agentloop → endTurn
-       （Ctrl+C：activeTurn.abort() → 循环以 kind:'aborted' 收尾，待答卡按拒绝唤醒）
-step:  model.next → assistant? return（回合完）
-                ↘ tool_calls? → executeTool(registry 查名→zod→run[工具内权限闸]→loop-guard)
-                              → 单条50k替换 → 批量200k预算 → append tool_result → 下一step（≤30）
+每轮:  user 输入(+history) → push+scheduleSave → createTurnRenderer(live|inline，非TTY退化inline)
+        → maybeCompactContext(micro:util≥50% 清旧 tool_result；auto:util≥85%×effectiveInput 中段 summarize)
+        → beginTurn+AbortController → agentloop（全部输出经回调走 renderer，回合内 stdout 发言权归它）
+        → endTurn → ui.finish(⏱汇总) → disposeActiveTurnRenderer
+        （Ctrl+C：activeTurn.abort()+interruptWaiters+abortActiveTurnRenderer → kind:'aborted' 收尾）
+ step:  onModelStart → model.next → assistant? return（回合完）
+                 ↘ tool_calls? → onToolStart → executeTool(registry 查名→zod→run[工具内权限闸]→loop-guard)
+                               → onToolResult → 单条50k替换 → 批量200k预算 → append tool_result → 下一step（≤30）
+弹卡:  审批/question 进场前经 onModalChange/onExternalWrite 广播 → renderer 先落历史再让 picker 画
 ```
 
 ## 4. 纪律（改代码前读）
 
 1. **一条消息只能有一个提交点**：agentloop 就地 push 共享数组，返回值是 `TurnReceipt`（不含消息）——caller 回推在类型层已不可能（历史双提交点 bug：重复 tool_use 破坏配对 → 模型连环重试）
 2. **引用纪律**：`scheduleSave` 存数组引用——换会话**重绑**新数组，同会话压缩**原地 splice**；两种写法各自只对一种场景正确
-3. **UI 只订阅回调**（`onAssistantMessage/onProgressMessage/onTurnDiags`/新增的 `onThinking`），不读 agentloop 内部状态
+3. **UI 只订阅回调**（`onModelStart/onToolStart/onToolResult` 为 B3 L1.5 新增，加上既有 `onAssistantMessage/onProgressMessage/onThinking/onTurnDiags`），不读 agentloop 内部状态；回合内 stdout 发言权归当轮 renderer，外部要写（picker 弹卡/readLine 提示符）先经广播落历史
 4. **deny 不可洗**：bash 的 `gateTouchedPaths` 与 write/edit 共用闸；新工具触达文件必须走 `resolveToolPath`
 5. **工具注册先于 adapter 构造**（快照语义），改启动顺序时小心
 6. **MCP 工具 schema 是 `z.unknown()` 直通**：参数校验实际发生在远端 server（-32602 会作为 ok:false 回给模型）

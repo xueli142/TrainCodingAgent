@@ -48,10 +48,35 @@ export function deliverLine(line: string): void {
   }
 }
 
+/** 模态深度变化广播（渲染器借此在弹卡前把自己画的行落成历史）；返回退订函数 */
+let modalChangeListeners: Array<(depth: number) => void> = []
+export function onModalChange(listener: (depth: number) => void): () => void {
+  modalChangeListeners.push(listener)
+  return () => {
+    modalChangeListeners = modalChangeListeners.filter(l => l !== listener)
+  }
+}
+
+function notifyModalChange(): void {
+  for (const listener of modalChangeListeners) {
+    listener(modals.length)
+  }
+}
+
+/** 回合内"别人要往 stdout 写东西/弹提示"的广播（readLine 带 prompt 时触发）；返回退订函数 */
+let externalWriteListeners: Array<() => void> = []
+export function onExternalWrite(listener: () => void): () => void {
+  externalWriteListeners.push(listener)
+  return () => {
+    externalWriteListeners = externalWriteListeners.filter(l => l !== listener)
+  }
+}
+
 /** 压入模态，返回弹出函数（owner 自行结算后必须调用返回值） */
 export function pushModal(spec: ModalSpec): () => void {
   const modal: Modal = { ...spec, closed: false }
   modals.push(modal)
+  notifyModalChange()
   return () => closeModal(modal)
 }
 
@@ -59,6 +84,7 @@ function closeModal(modal: Modal, bySystem = false): void {
   if (modal.closed) return
   modal.closed = true
   modals = modals.filter(m => m !== modal)
+  notifyModalChange()
   if (bySystem) {
     modal.onClose?.()
   }
@@ -143,6 +169,8 @@ export function attachInputSource(
 /** 读一行；返回 null 表示输入流已关闭（不可再交互）。模态激活期间请不要用本函数拿线，用 onLine */
 export function readLine(prompt?: string): Promise<string | null> {
   if (prompt) {
+    // 有回合内渲染器订阅时：先让它把活区落成历史，再把提示符打在干净位置
+    for (const listener of externalWriteListeners) listener()
     process.stdout.write(prompt)
   }
   if (queue.length > 0) {

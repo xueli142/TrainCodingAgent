@@ -1,18 +1,32 @@
 ﻿# icefox-agent
 
-一个用 **TypeScript** 写的极简 AI 编码 Agent CLI。
+<p align="center">
 
-核心理念：**模型 + 工具调用循环**。你把需求交给它，它自主决定调用哪些工具（读文件、搜索代码、执行命令……），把结果回灌给模型，循环往复，直到给出最终答复。
+极简个人coding agent
 
-设计取向：**事实与现场分离** —— 盘上永远保留全量事件（append-only），进入模型上下文的只是投影/裁剪后的视图。改代码前请先读 [`AGENTS.md`](AGENTS.md)。
+</p>
 
-## 特性
+icefox-agent 是一个用 **TypeScript** 写的教学/个人向极简终端编码 Agent。它用更小的实现体量（运行时依赖仅 `zod` / `diff` / `dotenv` / MCP SDK，`tsx` 直跑无构建），提供类 Claude Code 的 agent loop 工作流和架构思路，很适合学习、实验，以及继续做自己的定制化开发。改代码前请先读 [`AGENTS.md`](AGENTS.md)。
+
+## 项目简介
+
+整个项目围绕一个 terminal-first agent loop 构建，且**主循环只认一个分支变量**——模型的回应有且只有两种：文本（结束回合）或工具调用（执行后继续）。其余一切筛查、审批、持久化全部外置到对应模块：
+
+- 接收用户请求（REPL 输入 / slash 命令）
+- 检查当前工作区（read / glob / grep / bash）
+- 在需要时调用工具（zod 校验、loop-guard、权限闸在工具内自查）
+- 修改文件前先 review diff（审批卡弹出，拒绝不可被 bash 绕行）
+- 在同一个终端会话里返回最终结果（对话以 append-only 事件流落盘）
+
+设计取向是**事实与现场分离**：盘上永远保留全量事件，进入模型上下文的只是投影/裁剪后的视图。项目有意保持紧凑，让主控制流、工具模型和权限行为更容易理解和扩展。
+
+## 核心能力
 
 - 🔁 **Agent 循环** —— `model.next` → 执行工具 → 结果回灌 → 再次请求，单轮最多 30 步；返回 `TurnReceipt` 收据
 - 🧰 **11 个原子化工具** —— `read` / `write` / `edit` / `bash` / `glob` / `grep` / `todowrite` / `question` / `skill` / `task` / `webfetch`
 - 🔌 **MCP 客户端** —— 官方 SDK，stdio + Streamable HTTP，外部工具以 `mcp__server__tool` 融入同一管线，断线自动摘除、清单热更新
 - 🧠 **渐进式工具披露** —— 上下文里只放 `name + 一句话` 目录，完整 `input_schema` 走 API 的 `tools` 参数
-- 💾 **事件溯源会话** —— append-only JSONL，按 `message.id` 幂等增量落盘，支持恢复与切换
+- 💾 **事件溯源会话** —— append-only JSONL，按 `message.id` 幂等增量落盘（`SessionIndex` 缓存 seq/已存 id，全程只读一次全文），支持恢复与切换
 - 🗜️ **两层上下文压缩** —— 过半先清旧 tool_result（micro），85%×真实窗口再中段摘要（auto）
 - 📐 **真实 token 感知** —— usage 锚点+增量计数；窗口启动时向 provider `/models` 请求真值（拿不到回退 1M 并明说）
 - ⌨️ **轻 TUI** —— 审批/选择用方向键高亮卡片（单键直达、Esc 拒绝），Tab slash 补全，Ctrl+G 会话切换，常驻状态行
@@ -36,22 +50,22 @@ npx tsx smoke-mcp.ts                # MCP 连通性冒烟
 
 ### REPL 命令与按键
 
-| 命令 / 按键 | 说明 |
-| --- | --- |
-| `/exit`、空闲 `Ctrl+C`/`Ctrl+D` | 退出（先 flush trace/会话/MCP） |
-| **回合中 `Ctrl+C`** | 只取消当前回合，待答卡按拒绝结算 |
-| `/clear` | 清空上下文开新会话（旧会话在盘上可找回） |
-| `/sessions` | 列历史会话（当前带 `*`，尾行显示权限文件路径） |
-| `/rename <标题>` | 重命名当前会话 |
-| `/resume [id\|序号\|前缀]` | 切换会话（切换前打印上下文投影预览） |
-| `/compact` | 手动压缩（micro 优先，必要时 summary） |
-| `/mcp` | MCP 状态表（●/○/✗）；`/mcp connect|disconnect <name>` 运行时开关 |
-| `/status` | 状态行详版：tokens/利用率来源/warningLevel/MCP 明细 |
-| `/help` | 命令列表；`/delete` `/model` `/init` 为占位 |
-| `Tab` | slash 命令补全 |
-| `↑↓` | 输入历史（`history.jsonl` 持久化，启动载入） |
-| `Ctrl+G` / `Ctrl+L` | 会话选择器 / 状态行重绘 |
-| **审批卡按键** | `↑↓`/`jk` 移动 + Enter，或单键直达（y/a/n/d 或 1-7），`Esc`＝拒绝，`Ctrl+O` 展开 diff/明细 |
+| 命令 / 按键                           | 说明                                                                                                 |
+| ------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `/exit`、空闲 `Ctrl+C`/`Ctrl+D` | 退出（先 flush trace/会话/MCP）                                                                      |
+| **回合中 `Ctrl+C`**           | 只取消当前回合，待答卡按拒绝结算                                                                     |
+| `/clear`                            | 清空上下文开新会话（旧会话在盘上可找回）                                                             |
+| `/sessions`                         | 列历史会话（当前带`*`，尾行显示权限文件路径）                                                      |
+| `/rename <标题>`                    | 重命名当前会话                                                                                       |
+| `/resume [id\|序号\|前缀]`            | 切换会话（切换前打印上下文投影预览）                                                                 |
+| `/compact`                          | 手动压缩（micro 优先，必要时 summary）                                                               |
+| `/mcp`                              | MCP 状态表（●/○/✗）；`/mcp connect                                                                |
+| `/status`                           | 状态行详版：tokens/利用率来源/warningLevel/MCP 明细                                                  |
+| `/help`                             | 命令列表；`/delete` `/model` `/init` 为占位                                                    |
+| `Tab`                               | slash 命令补全                                                                                       |
+| `↑↓`                              | 输入历史（`history.jsonl` 持久化，启动载入）                                                       |
+| `Ctrl+G` / `Ctrl+L`               | 会话选择器 / 状态行重绘                                                                              |
+| **审批卡按键**                  | `↑↓`/`jk` 移动 + Enter，或单键直达（y/a/n/d 或 1-7），`Esc`＝拒绝，`Ctrl+O` 展开 diff/明细 |
 
 ## 工作原理
 
@@ -71,14 +85,21 @@ step: model.next → assistant? 结束回合
 
 ```
 src/
-├─ index.ts              # 装配根 + REPL：启动时序、斜杠命令、Ctrl+C 双语义、状态行、快捷键
+├─ index.ts              # 入口薄壳（~230 行）：装配时序、readline 循环、Ctrl+C 双语义接线
+├─ repl/                 # REPL 拆分层（TUI 复用的"回合 API"）
+│  ├─ context.ts         # ReplContext 共享状态容器（重绑=换会话 / 原地 splice=压缩）
+│  ├─ turn.ts            # runTurn：登记 user → 双层 compact → agentloop → 收据保存
+│  ├─ slash.ts           # SLASH_COMMANDS / slashCompleter / handleSlash 分发
+│  ├─ status.ts          # statusLine：session/model/ctx 利用率/mcp 就绪数
+│  └─ hotkeys.ts         # 空闲全局键：Ctrl+G 会话选择器 / Ctrl+L 重绘
+├─ question-ui.ts        # question 工具 TTY 接线（单选 picker / 多选行输入）
 ├─ agent_loop.ts         # ★ 主循环：唯一分支变量，TurnReceipt 收据，abort 配对
 ├─ anthropic-adapter.ts  # 线格式转换 + 重试退避 + thinking + trace 埋点
 ├─ prompt.ts  type.ts  tool.ts  config.ts        # 系统提示 / 类型 / 工具契约 / env+MCP 配置
 ├─ permissionManager.ts  permissionUi.ts          # 三把闸+分层记忆 / 审批卡→picker 适配
 ├─ tty-prompt.ts         # 单读者 + 模态栈键路由（keypress 听 stdin，line 栈顶优先）
 ├─ picker.ts             # 决策模态选择器（高亮列表/单键直达/Esc=fail-closed/Ctrl+O）
-├─ session.ts            # 事件溯源存储 + 投影（chunkId 可截断重放）
+├─ session.ts            # 事件溯源存储（SessionIndex 增量去重）+ 投影（chunkId 可截断重放）
 ├─ compact.ts            # micro（清旧 tool_result）+ auto（中段摘要）+ usage 标脏
 ├─ mcp.ts                # 官方 SDK 客户端：双 transport、sanitize 命名、热更新、运行时开关
 ├─ environment.ts  workspace.ts  file-review.ts   # 环境块 / 路径闸 / diff 审批写盘
@@ -94,13 +115,13 @@ src/
 
 ## 工具集要点
 
-| 工具 | 说明 |
-| --- | --- |
-| `bash` | 权限最重：拆段审批 + 绕行硬闸；`background:true`/尾随 `&` 起后台（日志 `jobs/`+退出码哨兵）；接取消信号杀进程树 |
-| `edit`/`write` | 改前必读（mtime/size 账本）→ diff 审批在工具内 → 写后记账 |
-| `skill` | 发现 `.icefox/skills`、`.claude/skills`（项目向上至 git 根 + 用户级），摘要进提示、正文按需加载 |
-| `question` | 单选走 picker 高亮卡，多选/无选项回落行输入 |
-| `mcp__*` | 远程 MCP 工具，description 带 "MCP tool from server" 标注；schema 直通（远端校验） |
+| 工具               | 说明                                                                                                                  |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `bash`           | 权限最重：拆段审批 + 绕行硬闸；`background:true`/尾随 `&` 起后台（日志 `jobs/`+退出码哨兵）；接取消信号杀进程树 |
+| `edit`/`write` | 改前必读（mtime/size 账本）→ diff 审批在工具内 → 写后记账                                                           |
+| `skill`          | 发现`.icefox/skills`、`.claude/skills`（项目向上至 git 根 + 用户级），摘要进提示、正文按需加载                    |
+| `question`       | 单选走 picker 高亮卡，多选/无选项回落行输入                                                                           |
+| `mcp__*`         | 远程 MCP 工具，description 带 "MCP tool from server" 标注；schema 直通（远端校验）                                    |
 
 ## MCP 配置
 

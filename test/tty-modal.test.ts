@@ -8,7 +8,9 @@ import {
   flushTypedInput,
   interruptWaiters,
   modalDepth,
+  onExternalWrite,
   onGlobalKey,
+  onModalChange,
   pushModal,
   readLine,
 } from '../src/tty-prompt.js'
@@ -122,4 +124,31 @@ test('EOF(close)：模态与等待者全部结算为 null/关闭', async () => {
   assert.equal(onClose, 1)
   assert.equal(await hung, null)
   assert.equal(await readLine(), null)
+})
+
+test('onModalChange：push/close/interruptWaiters 广播模态深度', () => {
+  const depths: number[] = []
+  const off = onModalChange(depth => depths.push(depth))
+  const pop = pushModal({ name: 'm' })
+  pushModal({ name: 'm2' })
+  pop()
+  interruptWaiters()
+  off
+  assert.deepEqual(depths.slice(0, 4), [1, 2, 1, 0])
+})
+
+test('onExternalWrite：readLine 带 prompt 时在写提示符前广播', () => {
+  const order: string[] = []
+  let promptWrite = 0
+  const off = onExternalWrite(() => order.push('notify'))
+  const origWrite = process.stdout.write.bind(process.stdout)
+  process.stdout.write = ((data: unknown) => { promptWrite += 1; order.push('write'); return true }) as typeof process.stdout.write
+  try {
+    void readLine('x')
+  } finally {
+    process.stdout.write = origWrite
+  }
+  off
+  assert.deepEqual(order.slice(0, 2), ['notify', 'write'])
+  assert.equal(promptWrite, 1)
 })

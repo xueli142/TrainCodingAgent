@@ -194,3 +194,71 @@ test('abort：批中途取消 → 剩余调用补配对 cancelled 结果，无�
   assert.deepEqual([...callIds].sort(), results.map(m => (m as any).toolUseId).sort())
   assert.ok(results.some(m => m.isError && String(m.content).includes('aborted')))
 })
+
+test('工具回调事件流：start/result 成对有序、字段齐全、批内 index/total 正确', async () => {
+  stubTool('t_events')
+  const events: Array<{ type: string; id?: string; [k: string]: unknown }> = []
+  const messages = baseMessages()
+  await agentloop({
+    model: scriptModel([
+      {
+        type: 'tool_calls',
+        calls: [
+          { id: 'e1', toolName: 't_events', input: { a: 1 } },
+          { id: 'e2', toolName: 't_events', input: { a: 2 } },
+        ],
+      },
+      { type: 'assistant', content: 'done', kind: 'final' },
+    ]),
+    messages,
+    cwd: process.cwd(),
+    onModelStart: step => events.push({ type: 'model', step }),
+    onToolStart: info => events.push({ type: 'start', ...info }),
+    onToolResult: info => events.push({ type: 'result', ...info }),
+  })
+
+  const starts = events.filter(e => e.type === 'start') as any[]
+  const results = events.filter(e => e.type === 'result') as any[]
+  assert.deepEqual(starts.map(s => s.toolUseId), ['e1', 'e2'])
+  assert.deepEqual(results.map(r => r.toolUseId), ['e1', 'e2'])
+  assert.deepEqual(starts.map(s => [s.index, s.total]), [[1, 2], [2, 2]])
+  // start 严格先于同名 result
+  assert.ok(events[1]?.type === 'start' && events[2]?.type === 'result')
+  assert.equal(starts[0].toolName, 't_events')
+  assert.deepEqual(starts[0].input, { a: 1 })
+  assert.ok(results.every(r => r.ok === true && typeof r.durationMs === 'number' && r.durationMs >= 0))
+  // model 回调在每步最前（step0 首发、step1 收尾前）
+  assert.deepEqual(events.filter(e => e.type === 'model').map(e => (e as any).step), [0, 1])
+})
+
+test('工具回调：abort 后跳过的调用不发 start 也不发 result', async () => {
+  const controller = new AbortController()
+  registerTool({
+    name: 't_skipcb',
+    description: 'aborting stub',
+    inputSchema: { type: 'object' },
+    schema: z.unknown(),
+    async run() {
+      controller.abort()
+      return { ok: true, output: 'ran once' }
+    },
+  })
+  const seen: string[] = []
+  await agentloop({
+    model: scriptModel([
+      {
+        type: 'tool_calls',
+        calls: [
+          { id: 's1', toolName: 't_skipcb', input: {} },
+          { id: 's2', toolName: 't_skipcb', input: {} },
+        ],
+      },
+    ]),
+    messages: baseMessages(),
+    cwd: process.cwd(),
+    signal: controller.signal,
+    onToolStart: info => seen.push(`start:${info.toolUseId}`),
+    onToolResult: info => seen.push(`result:${info.toolUseId}:${info.ok}`),
+  })
+  assert.deepEqual(seen, ['start:s1', 'result:s1:true'])
+})

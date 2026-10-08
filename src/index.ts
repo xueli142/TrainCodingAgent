@@ -36,12 +36,19 @@ import { handleSlash, slashCompleter } from './repl/slash.js'
 import { registerIdleHotkeys } from './repl/hotkeys.js'
 import { captureContextSnapshot, runTurn } from './repl/turn.js'
 import { statusLine } from './repl/status.js'
+import { abortActiveTurnRenderer, setTuiMode } from './repl/renderer.js'
 
 setDefaultResultOrder('ipv4first')
 initRegistry()
 installQuestionHandler()
 
 const argv = process.argv.slice(2)
+// 回合渲染模式：--inline 追加式 / --tui 活区（默认 live）；ICEFOX_TUI=inline 同级兜底，非 TTY 自动退化
+if (argv.includes('--inline') || process.env.ICEFOX_TUI === 'inline') {
+  setTuiMode('inline')
+} else {
+  setTuiMode('live')
+}
 const procEnv = buildProcessEnvironment()
 const projectEnv = buildProjectEnvironment(process.cwd(), procEnv)
 
@@ -141,6 +148,8 @@ async function main(): Promise<void> {
     if (ctx.activeTurn && !ctx.activeTurn.signal.aborted) {
       ctx.activeTurn.abort()
       const woken = interruptWaiters()
+      // 先让本回合渲染器静默收尾（停 timer、放弃行所有权），[interrupt] 才落在干净位置
+      abortActiveTurnRenderer()
       console.log(`\n[interrupt] 已取消当前回合${woken > 0 ? `（${woken} 张待答卡按拒绝处理）` : ''}`)
       return
     }
